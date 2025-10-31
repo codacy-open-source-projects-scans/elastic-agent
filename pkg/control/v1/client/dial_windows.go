@@ -1,0 +1,32 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+
+//go:build windows
+
+package client
+
+import (
+	"context"
+	"net"
+
+	"github.com/elastic/elastic-agent/pkg/control"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/elastic/elastic-agent-libs/api/npipe"
+)
+
+func dialContext(ctx context.Context) (*grpc.ClientConn, error) {
+	return grpc.DialContext( //nolint:staticcheck // Only the deprecated version allows this call to be blocking
+		ctx,
+		control.Address(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(dialer),
+	)
+}
+
+func dialer(ctx context.Context, addr string) (net.Conn, error) {
+	return npipe.DialContext(npipe.TransformString(addr))(ctx, "", "")
+}

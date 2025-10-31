@@ -1,0 +1,123 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bodyclose
+    - depguard
+    - durationcheck
+    - errcheck
+    - errorlint
+    - forbidigo
+    - gomoddirectives
+    - gomodguard
+    - gosec
+    - govet
+    - importas
+    - ineffassign
+    - misspell
+    - nakedret
+    - nilerr
+    - noctx
+    - nolintlint
+    - staticcheck
+    - unconvert
+    - unused
+    - wastedassign
+  settings:
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          deny:
+            - pkg: math/rand$
+              desc: superseded by math/rand/v2
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - (mapstr.M).Delete
+        - (mapstr.M).Put
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    forbidigo:
+      forbid:
+        - pattern: fmt.Print.*
+      exclude-godoc-examples: true
+    gomoddirectives:
+      replace-allow-list:
+        - github.com/Shopify/sarama
+        - github.com/dop251/goja
+        - github.com/dop251/goja_nodejs
+        - github.com/fsnotify/fsnotify
+        - github.com/fsnotify/fsevents
+        - github.com/openshift/api
+        - github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/consumption/armconsumption
+        - github.com/apoydence/eachers
+        - github.com/google/gopacket
+        - github.com/insomniacslk/dhcp
+        - github.com/meraki/dashboard-api-go/v3
+        - go.opentelemetry.io/otel/exporters/prometheus
+      replace-local: false
+    gomodguard:
+      blocked:
+        modules:
+          - github.com/pkg/errors:
+              recommendations:
+                - errors
+                - fmt
+              reason: This package is deprecated, use `fmt.Errorf` with `%w` instead
+          - github.com/google/uuid:
+              recommendations:
+                - github.com/gofrs/uuid/v5
+              reason: Use one uuid library consistently across the codebase
+    gosec:
+      excludes:
+        - G306
+        - G404
+        - G401
+        - G501
+        - G505
+    nolintlint:
+      require-explanation: true
+      require-specific: false
+      allow-unused: false
+    staticcheck:
+      checks:
+        - all
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - staticcheck
+        text: 'ST1003:'
+      - linters:
+          - forbidigo
+        path: (.*magefile.go|.*dev-tools/mage/.*)
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/elastic
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

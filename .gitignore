@@ -1,0 +1,65 @@
+# Directories
+/.agent-testing
+/.integration-cache
+/.ogc-cache
+/.vagrant
+/.idea
+/.vscode
+/build
+/*/*.template*.json
+**/html_docs
+data
+internal/pkg/agent/operation/tests/downloads
+
+# Files
+.DS_Store
+/beats.iml
+*.dev.yml
+*.generated.yml
+coverage.out
+.python-version
+beat.db
+*.keystore
+go_env.properties
+mage_output_file.go
+elastic_agent
+fleet.yml
+fleet.enc
+fleet.enc.lock
+env.sh
+.artifacts
+/docs/.artifacts
+
+# Editor swap files
+*.swp
+*.swo
+*.swn
+
+# Compiled Object files, Static and Dynamic libs (Shared Objects)
+*.o
+*.a
+*.so
+*.exe
+*.test
+*.prof
+*.pyc
+
+# Terraform
+*.terraform
+*.tfstate*
+
+# Files generated with the bump version automations
+*.bck
+
+# agent
+build/
+elastic-agent
+elastic-agent.dev.yml
+elastic-agent.yml.*
+!deploy/helm/*
+fleet.yml
+fleet.yml.lock
+fleet.yml.old
+pkg/component/fake/component/component
+internal/pkg/agent/install/testblocking/testblocking
+internal/pkg/otel/manager/testing/testing

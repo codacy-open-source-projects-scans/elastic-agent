@@ -1,0 +1,241 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+
+package kubernetes
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
+	"github.com/elastic/elastic-agent-libs/config"
+
+	"github.com/elastic/elastic-agent-autodiscover/kubernetes"
+	"github.com/elastic/elastic-agent-autodiscover/kubernetes/metadata"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/elastic/elastic-agent/pkg/core/logger"
+)
+
+func TestGenerateServiceData(t *testing.T) {
+	service := &kubernetes.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testsvc",
+			UID:       types.UID(uid),
+			Namespace: "testns",
+			Labels: map[string]string{
+				"foo":        "bar",
+				"with-dash":  "dash-value",
+				"with/slash": "some/path",
+			},
+			Annotations: map[string]string{
+				"baz": "ban",
+			},
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Service",
+			APIVersion: "v1",
+		},
+		Spec: v1.ServiceSpec{
+			ClusterIP: "1.2.3.4",
+			Selector: map[string]string{
+				"app":   "istiod",
+				"istio": "pilot",
+			},
+		},
+	}
+
+	data := generateServiceData(
+		service,
+		&svcMeta{},
+		mapstr.M{
+			"nsa": "nsb",
+		})
+
+	mapping := map[string]interface{}{
+		"service": mapstr.M{
+			"uid":  string(service.GetUID()),
+			"name": service.GetName(),
+			"ip":   service.Spec.ClusterIP,
+		},
+		"namespace_annotations": mapstr.M{
+			"nsa": "nsb",
+		},
+		"annotations": mapstr.M{
+			"baz": "ban",
+		},
+		"labels": mapstr.M{
+			"foo":        "bar",
+			"with-dash":  "dash-value",
+			"with/slash": "some/path",
+		},
+	}
+
+	processors := map[string]interface{}{
+		"orchestrator": mapstr.M{
+			"cluster": mapstr.M{
+				"name": "devcluster",
+				"url":  "8.8.8.8:9090"},
+		}, "kubernetes": mapstr.M{
+			"service": mapstr.M{
+				"uid":  string(service.GetUID()),
+				"name": service.GetName(),
+				"ip":   "1.2.3.4",
+			},
+			"labels": mapstr.M{
+				"foo":        "bar",
+				"with-dash":  "dash-value",
+				"with/slash": "some/path",
+			},
+			"annotations": mapstr.M{
+				"baz": "ban",
+			},
+		},
+	}
+
+	assert.Equal(t, service, data.service)
+	assert.Equal(t, mapping, data.mapping)
+	for _, v := range data.processors {
+		k, _ := v["add_fields"].(map[string]interface{})
+		target, _ := k["target"].(string)
+		fields := k["fields"]
+		assert.Equal(t, processors[target], fields)
+	}
+}
+
+func TestServiceEventer_NamespaceWatcher(t *testing.T) {
+	client := k8sfake.NewSimpleClientset()
+
+	log, err := logger.New("service-eventer-test", true)
+	assert.NoError(t, err)
+
+	providerDataChan := make(chan providerData, 1)
+
+	comm := MockDynamicComm{
+		context.TODO(),
+		providerDataChan,
+	}
+
+	tests := []struct {
+		namespaceEnabled bool
+		hintsEnabled     bool
+		expectedNil      bool
+		name             string
+		msg              string
+	}{
+		{
+			namespaceEnabled: false,
+			hintsEnabled:     false,
+			expectedNil:      true,
+			name:             "add_resource_metadata.namespace disabled and hints disabled.",
+			msg:              "Namespace watcher should be nil.",
+		},
+		{
+			namespaceEnabled: false,
+			hintsEnabled:     true,
+			expectedNil:      false,
+			name:             "add_resource_metadata.namespace disabled and hints enabled.",
+			msg:              "Namespace watcher should not be nil.",
+		},
+		{
+			namespaceEnabled: true,
+			hintsEnabled:     false,
+			expectedNil:      false,
+			name:             "add_resource_metadata.namespace enabled and hints disabled.",
+			msg:              "Namespace watcher should not be nil.",
+		},
+		{
+			namespaceEnabled: true,
+			hintsEnabled:     false,
+			expectedNil:      false,
+			name:             "add_resource_metadata default and hints default.",
+			msg:              "Watcher should not be nil.",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var cfg Config
+			cfg.InitDefaults()
+
+			nsCfg, err := config.NewConfigFrom(map[string]interface{}{
+				"enabled": test.namespaceEnabled,
+			})
+			assert.NoError(t, err)
+
+			cfg.AddResourceMetadata.Namespace = nsCfg
+			cfg.Hints.Enabled = test.hintsEnabled
+
+			eventer, err := NewServiceEventer(&comm, &cfg, log, client, "cluster", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			namespaceWatcher := eventer.(*service).namespaceWatcher
+
+			if test.expectedNil {
+				assert.Equalf(t, nil, namespaceWatcher, test.msg)
+			} else {
+				assert.NotEqualf(t, nil, namespaceWatcher, test.msg)
+			}
+		})
+	}
+}
+
+type svcMeta struct{}
+
+// Generate generates svc metadata from a resource object
+// All Kubernetes fields that need to be stored under kubernetes. prefix are populated by
+// GenerateK8s method while fields that are part of ECS are generated by GenerateECS method
+func (s *svcMeta) Generate(obj kubernetes.Resource, opts ...metadata.FieldOptions) mapstr.M {
+	ecsFields := s.GenerateECS(obj)
+	meta := mapstr.M{
+		"kubernetes": s.GenerateK8s(obj, opts...),
+	}
+	meta.DeepUpdate(ecsFields)
+	return meta
+}
+
+// GenerateECS generates svc ECS metadata from a resource object
+func (s *svcMeta) GenerateECS(obj kubernetes.Resource) mapstr.M {
+	return mapstr.M{
+		"orchestrator": mapstr.M{
+			"cluster": mapstr.M{
+				"name": "devcluster",
+				"url":  "8.8.8.8:9090",
+			},
+		},
+	}
+}
+
+// GenerateK8s generates svc metadata from a resource object
+func (s *svcMeta) GenerateK8s(obj kubernetes.Resource, opts ...metadata.FieldOptions) mapstr.M {
+	k8sNode, _ := obj.(*kubernetes.Service)
+	return mapstr.M{
+		"service": mapstr.M{
+			"uid":  string(k8sNode.GetUID()),
+			"name": k8sNode.GetName(),
+			"ip":   "1.2.3.4",
+		},
+		"labels": mapstr.M{
+			"foo":        "bar",
+			"with-dash":  "dash-value",
+			"with/slash": "some/path",
+		},
+		"annotations": mapstr.M{
+			"baz": "ban",
+		},
+	}
+}
+
+// GenerateFromName generates svc metadata from a node name
+func (s *svcMeta) GenerateFromName(name string, opts ...metadata.FieldOptions) mapstr.M {
+	return nil
+}

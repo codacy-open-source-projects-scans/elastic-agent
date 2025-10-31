@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kube-system
+
+secretGenerator:
+  - name: elastic-agent-creds
+    literals:
+      - enrollment_token=%ENROLLMENT_TOKEN%
+
+configMapGenerator:
+- name: elastic-agent-configs
+  literals:
+  - host=%FLEET_URL%
+
+resources:
+  - ./base
+  - https://github.com/kubernetes/kube-state-metrics/?ref=v2.15.0
+
+patches:
+- path: environmental-variables-remove.yaml
+- target:
+    group: apps
+    version: v1
+    kind: DaemonSet
+    name: elastic-agent
+  path: fleet-enrollment-token-patch.yaml

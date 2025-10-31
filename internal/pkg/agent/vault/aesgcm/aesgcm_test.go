@@ -1,0 +1,128 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+
+package aesgcm
+
+import (
+	"crypto/rand"
+	"strconv"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/elastic/elastic-agent/internal/pkg/testutils/fipsutils"
+)
+
+var testKeyTypes []AESKeyType = []AESKeyType{AES128, AES192, AES256}
+
+func TestNewKey(t *testing.T) {
+	for _, kt := range testKeyTypes {
+		b, err := NewKey(kt)
+		if err != nil {
+			t.Error(err)
+		}
+
+		diff := cmp.Diff(int(kt), len(b))
+		if diff != "" {
+			t.Error(diff)
+		}
+	}
+}
+
+func TestEncryptDecrypt(t *testing.T) {
+	fipsutils.SkipIfFIPSOnly(t, "aesgcm does not use NewGCMWithRandomNonce.")
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "nil",
+		},
+		{
+			name: "empty",
+			data: []byte{},
+		},
+		{
+			name: "foobar",
+			data: []byte("foobar"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, kt := range testKeyTypes {
+				t.Run(kt.String(), func(t *testing.T) {
+					key, err := NewKey(kt)
+					if err != nil {
+						t.Error(err)
+					}
+					enc, err := Encrypt(key, tc.data)
+					if err != nil {
+						t.Error(err)
+					}
+					dec, err := Decrypt(key, enc)
+					if err != nil {
+						t.Error(err)
+					}
+
+					if len(tc.data) == 0 {
+						diff := cmp.Diff(len(tc.data), len(dec))
+						if diff != "" {
+							t.Error(diff)
+						}
+					} else {
+						diff := cmp.Diff(tc.data, dec)
+						if diff != "" {
+							t.Error(diff)
+						}
+					}
+				})
+			}
+		})
+	}
+
+}
+
+func TestEncryptDecryptDifferentLengths(t *testing.T) {
+	fipsutils.SkipIfFIPSOnly(t, "aesgcm does not use NewGCMWithRandomNonce.")
+	const maxDataSize = 55 // test for sufficient length for the key and a bit more
+	for _, kt := range testKeyTypes {
+		t.Run(kt.String(), func(t *testing.T) {
+			key, err := NewKey(kt)
+			if err != nil {
+				t.Error(err)
+			}
+			for i := 0; i < maxDataSize; i++ {
+				data := make([]byte, i)
+				_, err := rand.Read(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				name := strconv.Itoa(i)
+				t.Run(name, func(t *testing.T) {
+					enc, err := Encrypt(key, data)
+					if err != nil {
+						t.Error(err)
+					}
+					dec, err := Decrypt(key, enc)
+					if err != nil {
+						t.Error(err)
+					}
+
+					if len(data) == 0 {
+						diff := cmp.Diff(len(data), len(dec))
+						if diff != "" {
+							t.Error(diff)
+						}
+					} else {
+						diff := cmp.Diff(data, dec)
+						if diff != "" {
+							t.Error(diff)
+						}
+					}
+				})
+			}
+		})
+	}
+}

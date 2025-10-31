@@ -1,0 +1,201 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+
+package vault
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/elastic/elastic-agent/internal/pkg/agent/vault/aesgcm"
+	"github.com/elastic/elastic-agent/internal/pkg/testutils/fipsutils"
+)
+
+func getTestFileVaultPath(t *testing.T) string {
+	dir := t.TempDir()
+	return filepath.Join(dir, "vault")
+}
+
+func TestFileVault(t *testing.T) {
+	fipsutils.SkipIfFIPSOnly(t, "vault does not use NewGCMWithRandomNonce.")
+	vaultPath := getTestFileVaultPath(t)
+
+	ctx, cn := context.WithCancel(context.Background())
+	defer cn()
+	options, err := ApplyOptions(WithVaultPath(vaultPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := NewFileVault(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer v.Close()
+
+	const (
+		key1 = "key1"
+		key2 = "key2"
+		key3 = "key3"
+
+		val1 = "value1"
+		val2 = "value22"
+		val3 = "value3"
+	)
+
+	keys := []string{key1, key2, key3}
+	vals := []string{val1, val2, val3}
+
+	// Test that keys do not exists
+	for _, key := range keys {
+		exists, err := v.Exists(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		diff := cmp.Diff(exists, false)
+		if diff != "" {
+			t.Fatal(diff)
+		}
+	}
+
+	// Create keys, except the last one
+	for i := 0; i < len(keys)-1; i++ {
+		err := v.Set(ctx, keys[i], []byte(vals[i]))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Verify the keys that were created now exist
+	for i := 0; i < len(keys)-1; i++ {
+		exists, err := v.Exists(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		diff := cmp.Diff(exists, true)
+		if diff != "" {
+			t.Fatal(diff)
+		}
+	}
+
+	// Verify the keys values
+	for i := 0; i < len(keys)-1; i++ {
+		b, err := v.Get(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		diff := cmp.Diff(b, []byte(vals[i]))
+		if diff != "" {
+			t.Fatal(diff)
+		}
+	}
+
+	// Verify that the last key that was not creates still doesn't exists
+	exists, err := v.Exists(ctx, keys[len(keys)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := cmp.Diff(exists, false)
+	if diff != "" {
+		t.Fatal(diff)
+	}
+
+	// Delete the first key
+	err = v.Remove(ctx, keys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that just deleted key doesn't exist anymore
+	exists, err = v.Exists(ctx, keys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	diff = cmp.Diff(exists, false)
+	if diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+type secret struct {
+	Value     []byte    `json:"v"` // binary value
+	CreatedOn time.Time `json:"t"` // date/time the secret was created on
+}
+
+func TestFileVaultConcurrent(t *testing.T) {
+	fipsutils.SkipIfFIPSOnly(t, "vault does not use NewGCMWithRandomNonce.")
+	const (
+		parallel   = 15
+		iterations = 7
+
+		key = `secret`
+	)
+
+	vaultPath := getTestFileVaultPath(t)
+
+	ctx, cn := context.WithCancel(context.Background())
+	defer cn()
+
+	for i := 0; i < iterations; i++ {
+		g, _ := errgroup.WithContext(context.Background())
+		for j := 0; j < parallel; j++ {
+			g.Go(func() error {
+				return doCrud(t, ctx, vaultPath, key)
+			})
+		}
+		err := g.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func doCrud(t *testing.T, ctx context.Context, vaultPath, key string) error {
+	options, err := ApplyOptions(WithVaultPath(vaultPath))
+	if err != nil {
+		return err
+	}
+	v, err := NewFileVault(ctx, options)
+	if err != nil {
+		return fmt.Errorf("could not create new vault: %w", err)
+	}
+	defer v.Close()
+
+	// Create new AES256 key
+	k, err := aesgcm.NewKey(aesgcm.AES256)
+	if err != nil {
+		return err
+	}
+
+	sec := secret{
+		Value:     k,
+		CreatedOn: time.Now().UTC(),
+	}
+
+	b, err := json.Marshal(sec)
+	if err != nil {
+		return fmt.Errorf("could not marshal secret: %w", err)
+	}
+
+	err = v.Set(ctx, key, b)
+	if err != nil {
+		return fmt.Errorf("failed to set secret: %w", err)
+	}
+
+	_, err = v.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("failed to get secret: %w", err)
+	}
+
+	return nil
+}

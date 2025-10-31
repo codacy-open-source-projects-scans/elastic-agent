@@ -1,0 +1,16 @@
+system:
+  enabled: true
+  authLogs:
+    vars:
+      paths:
+        - /var/log/custom_auth.log
+  syslog:
+    vars:
+      paths:
+        - /var/log/custom_syslog.log
+kubernetes:
+  enabled: false
+kube-state-metrics:
+  enabled: false
+agent:
+  unprivileged: true

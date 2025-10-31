@@ -1,0 +1,118 @@
+version: 2
+component_files:
+ - endpoint-security-resources.zip
+inputs:
+  - name: endpoint
+    description: "Endpoint Security"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    outputs: &outputs
+      - elasticsearch
+      - logstash
+      - kafka
+    proxied_actions: &proxied_actions
+      - UNENROLL
+      - UPGRADE
+      - MIGRATE
+    runtime:
+      preventions:
+        - condition: ${runtime.native_arch} != '' and ${runtime.arch} != ${runtime.native_arch}
+          message: "Elastic Defend cannot run on an emulated architecture"
+        - condition: ${runtime.arch} == 'arm64' and ${runtime.family} == 'redhat' and ${runtime.major} == 7
+          message: "Elastic Defend doesn't support RHEL7 on arm64"
+        - condition: ${user.root} == false
+          message: "Elastic Defend requires Elastic Agent be running as root"
+        - condition: ${install.in_default} == false
+          message: "Elastic Defend requires Elastic Agent be installed at the default installation path"
+    service: &service
+      cport: 6788
+      csocket: ".eaci.sock"
+      log:
+        path: "/opt/Elastic/Endpoint/state/log/endpoint-*.log"
+      operations: &operations
+        check:
+          args:
+            - "verify"
+            - "--log"
+            - "stderr"
+          timeout: 60s
+          non_fatal_exit_codes:
+            - 28 # tamper protection enabled but could not (re)install - posix code
+            - 284 # tamper protection enabled but could not (re)install - windows code
+        install:
+          args:
+            - "install"
+            - "--log"
+            - "stderr"
+            - "--upgrade"
+            - "--resources"
+            - "endpoint-security-resources.zip"
+          timeout: 600s
+          non_fatal_exit_codes:
+            - 28 # tamper protection enabled but could not (re)install
+        uninstall:
+          args:
+            - "uninstall"
+            - "--log"
+            - "stderr"
+            - "--uninstall-token"
+          timeout: 600s
+  - name: endpoint
+    description: "Endpoint Security"
+    platforms:
+      - darwin/amd64
+      - darwin/arm64
+    outputs: *outputs
+    proxied_actions: *proxied_actions
+    runtime:
+      preventions:
+        - condition: ${runtime.arch} != ${runtime.native_arch}
+          message: "Elastic Defend cannot run on an emulated architecture"
+        - condition: ${user.root} == false
+          message: "Elastic Defend requires Elastic Agent be running as root"
+        - condition: ${install.in_default} == false
+          message: "Elastic Defend requires Elastic Agent be installed at the default installation path"
+    service:
+      cport: 6788
+      csocket: ".eaci.sock"
+      log:
+        path: "/Library/Elastic/Endpoint/state/log/endpoint-*.log"
+      operations: *operations
+  - name: endpoint
+    description: "Endpoint Security"
+    platforms:
+      - windows/amd64
+      - windows/arm64
+    outputs: *outputs
+    proxied_actions: *proxied_actions
+    runtime:
+      preventions:
+        - condition: ${user.root} == false
+          message: "Elastic Defend requires Elastic Agent be running as Administrator or SYSTEM"
+        - condition: ${install.in_default} == false
+          message: "Elastic Defend requires Elastic Agent be installed at the default installation path"
+        - condition: ${runtime.native_arch} != '' and ${runtime.arch} != ${runtime.native_arch}
+          message: "Elastic Defend cannot be installed on an emulated architecture"
+        - condition: ${runtime.major} < 6 or (${runtime.major} == 6 and ${runtime.minor} < 2)
+          message: "Elastic Defend requires Windows 10 / Server 2012 or newer."
+    service:
+      cport: 6788
+      csocket: ".eaci.sock"
+      log:
+        path: "C:\\Program Files\\Elastic\\Endpoint\\state\\log\\endpoint-*.log"
+      operations: *operations
+  - name: endpoint
+    description: "Endpoint Security"
+    platforms:
+      - container/amd64
+      - container/arm64
+    outputs: *outputs
+    proxied_actions: *proxied_actions
+    runtime:
+      preventions:
+        - condition: ${runtime.arch} == 'arm64' and ${runtime.family} == 'redhat' and ${runtime.major} == 7
+          message: "No support for RHEL7 on arm64"
+        - condition: ${user.root} == false
+          message: "Elastic Agent must be running as root"
+    service: *service

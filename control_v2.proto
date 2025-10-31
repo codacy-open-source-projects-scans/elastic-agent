@@ -1,0 +1,409 @@
+// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+// or more contributor license agreements. Licensed under the Elastic License;
+// you may not use this file except in compliance with the Elastic License.
+
+syntax = "proto3";
+
+package cproto;
+
+option cc_enable_arenas = true;
+option go_package = "internal/pkg/agent/control/v2/cproto";
+import "google/protobuf/timestamp.proto";
+
+// State codes for the current state.
+enum State {
+  STARTING = 0;
+  CONFIGURING = 1;
+  HEALTHY = 2;
+  DEGRADED = 3;
+  FAILED = 4;
+  STOPPING = 5;
+  STOPPED = 6;
+  UPGRADING = 7;
+  ROLLBACK = 8;
+}
+
+// CollectorComponentStatus used for OTel collector components.
+enum CollectorComponentStatus {
+    StatusNone = 0;
+    StatusStarting = 1;
+    StatusOK = 2;
+    StatusRecoverableError = 3;
+    StatusPermanentError = 4;
+    StatusFatalError = 5;
+    StatusStopping = 6;
+    StatusStopped = 7;
+}
+
+// Unit Type running inside a component.
+enum UnitType {
+  INPUT = 0;
+  OUTPUT = 1;
+}
+
+// Action status codes for restart and upgrade response.
+enum ActionStatus {
+  // Action was successful.
+  SUCCESS = 0;
+  // Action failed.
+  FAILURE = 1;
+}
+
+// pprof endpoint that can be requested.
+enum PprofOption {
+	ALLOCS = 0;
+	BLOCK = 1;
+	CMDLINE = 2;
+	GOROUTINE = 3;
+	HEAP = 4;
+	MUTEX = 5;
+	PROFILE = 6;
+	THREADCREATE = 7;
+	TRACE = 8;
+}
+
+// Empty message.
+message Empty {
+}
+
+// Version response message.
+message VersionResponse {
+  // Current running version.
+  string version = 1;
+  // Current running commit.
+  string commit = 2;
+  // Current running build time.
+  string buildTime = 3;
+  // Current running version is a snapshot.
+  bool snapshot = 4;
+  // Current running version is FIPS-compliant.
+  bool fips = 5;
+}
+
+message RestartResponse {
+  // Response status.
+  ActionStatus status = 1;
+  // Error message when it fails to trigger restart.
+  string error = 2;
+}
+
+// Upgrade request message.
+message UpgradeRequest {
+  // (Optional) Version to upgrade to.
+  //
+  // If not provided Elastic Agent will auto discover the latest version in the same major
+  // to upgrade to. If wanting to upgrade to a new major that major must be present in the
+  // this version field.
+  string version = 1;
+
+  // (Optional) Use a different source URI then configured.
+  //
+  // If provided the upgrade process will use the provided sourceURI instead of the configured
+  // sourceURI in the configuration.
+  string sourceURI = 2;
+
+  // (Optional) Overrides predefined behavior for agent package verification.
+  //
+  // If provided Elastic Agent package is not checked for signature during upgrade.
+  bool skipVerify = 3;
+
+  // (Optional) Overrides predefined behavior for agent package verification.
+  //
+  // If provided Elastic Agent package is checked against these pgp keys as well.
+  repeated string pgpBytes = 4;
+
+  // (Optional) Overrides predefined behavior for agent package verification.
+  //
+  // If provided Elastic Agent package embedded PGP key is not checked for signature during upgrade.
+  bool skipDefaultPgp = 5;
+
+  // If true it indicates that we wish to rollback the current/last upgrade
+  bool rollback = 6;
+}
+
+// A upgrade response message.
+message UpgradeResponse {
+  // Response status.
+  ActionStatus status = 1;
+
+  // Version that is being upgraded to.
+  string version = 2;
+
+  // Error message when it fails to trigger upgrade.
+  string error = 3;
+}
+
+message ComponentUnitState {
+  // Type of unit in the component.
+  UnitType unit_type = 1;
+  // ID of the unit in the component.
+  string unit_id = 2;
+  // Current state.
+  State state = 3;
+  // Current state message.
+  string message = 4;
+  // Current state payload.
+  string payload = 5;
+}
+
+// Version information reported by the component to Elastic Agent.
+message ComponentVersionInfo {
+  // Name of the component.
+  string name = 1;
+  // 2 reserved - used to be used for version of component.
+  // Extra meta information about the version.
+  map<string, string> meta = 3;
+}
+
+// Current state of a running component by Elastic Agent.
+message ComponentState {
+  // Unique component ID.
+  string id = 1;
+  // Component name.
+  string name = 2;
+  // Current state.
+  State state = 3;
+  // Current state message.
+  string message = 4;
+  // Current units running in the component.
+  repeated ComponentUnitState units = 5;
+  // Current version information for the running component.
+  ComponentVersionInfo version_info = 6;
+}
+
+message StateAgentInfo {
+  // Current ID of the Agent.
+  string id = 1;
+  // Current running version.
+  string version = 2;
+  // Current running commit.
+  string commit = 3;
+  // Current running build time.
+  string buildTime = 4;
+  // Current running version is a snapshot.
+  bool snapshot = 5;
+  // Current running PID.
+  int32 pid = 6;
+  // True when running as unprivileged.
+  bool unprivileged = 7;
+  // True when agent is managed by fleet
+  bool isManaged = 8;
+}
+
+// CollectorComponent is the status of an OTel collector component.
+message CollectorComponent {
+  // Status of the component.
+  CollectorComponentStatus status = 1;
+  // Error is set to the reported error.
+  string error = 2;
+  // Timestamp of status.
+  string timestamp = 3;
+  // Status information for sub-components of this component.
+  map<string, CollectorComponent> ComponentStatusMap = 4;
+}
+
+// StateResponse is the current state of Elastic Agent.
+// Next unused id: 8
+message StateResponse {
+  // Overall information of Elastic Agent.
+  StateAgentInfo info = 1;
+
+  // Overall state + message of Elastic Agent, aggregating errors in other
+  // states and components
+  State state = 2;
+  string message = 3;
+
+  // Fleet state: healthy / "Connected" if the last RPC call to Fleet
+  // succeeded, otherwise failed with the associated error string.
+  State fleetState = 5;
+  string fleetMessage = 6;
+
+  // State of each component in Elastic Agent.
+  repeated ComponentState components = 4;
+
+  // Upgrade details
+  UpgradeDetails upgrade_details = 7;
+
+  // OTel collector component status information.
+  CollectorComponent collector = 8;
+}
+
+// UpgradeDetails captures the details of an ongoing Agent upgrade.
+message UpgradeDetails {
+  // Version the Agent is being upgraded to.
+  string target_version = 1;
+
+  // Current state of the upgrade process.
+  string state = 2;
+
+  // Fleet Action ID that initiated the upgrade, if in managed mode.
+  string action_id = 3;
+
+  // Metadata about the upgrade process.
+  UpgradeDetailsMetadata metadata = 4;
+}
+
+// UpgradeDetailsMetadata has additional information about an Agent's
+// ongoing upgrade.
+message UpgradeDetailsMetadata {
+  // If the upgrade is a scheduled upgrade, the timestamp of when the
+  // upgrade is expected to start.
+  string scheduled_at = 1;
+
+  // If the upgrade is in the UPG_DOWNLOADING state, the percentage of
+  // the Elastic Agent artifact that has already been downloaded, to
+  // serve as an indicator of download progress.
+  float download_percent = 2;
+
+  // If the upgrade has failed, what upgrade state failed.
+  string failed_state = 3;
+
+  // Any error encountered during the upgrade process.
+  string error_msg = 4;
+
+  // Any error message that is a result of a retryable upgrade
+  // step, e.g. the download step, being retried.
+  string retry_error_msg = 5;
+
+  // The deadline until when a retryable upgrade step, e.g. the download
+  // step, will be retried.
+  string retry_until = 6;
+
+  // Reason is a string that may give out more information about transitioning to the current state.
+  // It has been introduced initially to distinguish between manual and automatic rollbacks
+  string reason = 7;
+}
+
+// DiagnosticFileResult is a file result from a diagnostic result.
+message DiagnosticFileResult {
+  // Human readable name of the diagnostic result content.
+  string name = 1;
+  // Filename to use to store the diagnostic to the disk.
+  string filename = 2;
+  // Human readable description of the information this diagnostic provides.
+  string description = 3;
+  // Content-Type of the resulting content.
+  string content_type = 4;
+  // Actual file content.
+  bytes content = 5;
+  // Timestamp the content was generated at.
+  google.protobuf.Timestamp generated = 6;
+}
+
+// DiagnosticAgentRequest is request to gather diagnostic information about the Elastic Agent.
+message DiagnosticAgentRequest {
+  repeated AdditionalDiagnosticRequest additional_metrics = 1;
+}
+
+// DiagnosticAgentRequestAdditional is an enum of additional diagnostic metrics that can be requested from Elastic Agent.
+enum AdditionalDiagnosticRequest {
+  CPU = 0;
+  CONN = 1;
+}
+
+// DiagnosticComponentsRequest is the message to request diagnostics from individual components.
+message DiagnosticComponentsRequest {
+  repeated DiagnosticComponentRequest components  = 1;
+  repeated AdditionalDiagnosticRequest additional_metrics = 2;
+}
+
+// DiagnosticComponentRequest specifies the component to send a diagnostic request to.
+message DiagnosticComponentRequest {
+  // ID of the component.
+  string component_id = 1;
+}
+
+// DiagnosticAgentResponse is response to gathered diagnostic information about the Elastic Agent.
+message DiagnosticAgentResponse {
+  // Diagnostic results for the agent.
+  repeated DiagnosticFileResult results = 1;
+}
+
+// DiagnosticUnitRequest specifies a specific unit to gather diagnostics from.
+message DiagnosticUnitRequest {
+  // ID of the component.
+  string component_id = 1;
+  // Type of unit.
+  UnitType unit_type = 2;
+  // ID of the unit.
+  string unit_id = 3;
+}
+
+// DiagnosticUnitsRequest allows a diagnostic request to specify the units to target.
+message DiagnosticUnitsRequest {
+  // Specific units to target. (If no units are given then a result for all units is provided).
+  repeated DiagnosticUnitRequest units = 1;
+}
+
+// DiagnosticUnitResponse is diagnostic information about a specific unit.
+message DiagnosticUnitResponse {
+  // ID of the component.
+  string component_id = 1;
+  // Type of unit.
+  UnitType unit_type = 2;
+  // ID of the unit.
+  string unit_id = 3;
+  // Error message for the failure fetching diagnostic information for this unit.
+  string error = 4;
+  // Diagnostic results for the unit.
+  repeated DiagnosticFileResult results = 5;
+}
+
+// DiagnosticComponentResponse is the response diagnostic information for a component-level diagnostic request
+message DiagnosticComponentResponse {
+  // ID of the component.
+  string component_id = 1;
+  // Error message for the failure fetching diagnostic information for this unit.
+  string error = 4;
+  // Diagnostic results for the unit.
+  repeated DiagnosticFileResult results = 5;
+}
+
+// DiagnosticUnitsResponse is response to gathered units diagnostic information.
+message DiagnosticUnitsResponse {
+  // Diagnostics results per unit.
+  repeated DiagnosticUnitResponse units = 2;
+}
+
+// ConfigureRequest sends a new configuration for the running Elastic Agent to use.
+message ConfigureRequest {
+  // Config to use.
+  string config = 1;
+}
+
+service ElasticAgentControl {
+  // Fetches the currently running version of the Elastic Agent.
+  rpc Version(Empty) returns (VersionResponse);
+
+  // Fetches the currently states of the Elastic Agent.
+  rpc State(Empty) returns (StateResponse);
+
+  // Streams the current state of the Elastic Agent to the client.
+  //
+  // Client will continue to get updated StateResponse when any state
+  // of the Elastic Agent has changed.
+  rpc StateWatch(Empty) returns (stream StateResponse);
+
+  // Restart restarts the current running Elastic Agent.
+  rpc Restart(Empty) returns (RestartResponse);
+
+  // Upgrade starts the upgrade process of Elastic Agent.
+  rpc Upgrade(UpgradeRequest) returns (UpgradeResponse);
+
+  // Gather diagnostic information for the running Elastic Agent.
+  rpc DiagnosticAgent(DiagnosticAgentRequest) returns (DiagnosticAgentResponse);
+
+  // Gather diagnostic information for the running units.
+  rpc DiagnosticUnits(DiagnosticUnitsRequest) returns (stream DiagnosticUnitResponse);
+
+  // Gather diagnostic information for the running components.
+  rpc DiagnosticComponents(DiagnosticComponentsRequest) returns (stream DiagnosticComponentResponse);
+
+  // Configure adjusts the running Elastic Agent configuration with the configuration
+  // provided over the RPC.
+  //
+  // This is only allowed if the Elastic Agent is spawned in TESTING_MODE. Calling this
+  // on any Elastic Agent that is not in TESTING_MODE will result in an error being
+  // returned and nothing occurring.
+  rpc Configure(ConfigureRequest) returns (Empty);
+}

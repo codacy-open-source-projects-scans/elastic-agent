@@ -1,0 +1,30 @@
+inputs:
+    - name: filestream-suricata
+      id: filestream-suricata-${kubernetes.hints.container_id}
+      type: filestream
+      use_output: default
+      streams:
+        - condition: ${kubernetes.hints.suricata.eve.enabled} == true or ${kubernetes.hints.suricata.enabled} == true
+          data_stream:
+            dataset: suricata.eve
+            type: logs
+          exclude_files:
+            - .gz$
+          file_identity:
+            fingerprint: null
+          id: filestream-suricata-suricata-eve-${kubernetes.hints.container_id}
+          parsers:
+            - container:
+                format: auto
+                stream: ${kubernetes.hints.suricata.eve.stream|'all'}
+          paths:
+            - /var/log/containers/*${kubernetes.hints.container_id}.log
+          prospector:
+            scanner:
+                fingerprint:
+                    enabled: true
+                symlinks: true
+          tags:
+            - forwarded
+            - suricata-eve
+      data_stream.namespace: default
