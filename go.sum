@@ -503,8 +503,8 @@ github.com/eclipse/paho.mqtt.golang v1.3.5 h1:sWtmgNxYM9P2sP+xEItMozsR3w0cqZFlqn
 github.com/eclipse/paho.mqtt.golang v1.3.5/go.mod h1:eTzb4gxwwyWpqBUHGQZ4ABAV7+Jgm1PklsYT/eo8Hcc=
 github.com/edsrzf/mmap-go v1.2.0 h1:hXLYlkbaPzt1SaQk+anYwKSRNhufIDCchSPkUD6dD84=
 github.com/edsrzf/mmap-go v1.2.0/go.mod h1:19H/e8pUPLicwkyNgOykDXkJ9F0MHE+Z52B8EIth78Q=
-github.com/elastic/apm-data v1.18.0 h1:GaWnrIoh7+UPmsbkQGls3tSCVk54sJng2v2YCYGpwyM=
-github.com/elastic/apm-data v1.18.0/go.mod h1:Bm4VpGkWHwVRAA32kVyVk1f9urv0dnh86DGFdOIiewk=
+github.com/elastic/apm-data v1.19.5 h1:Rc8bcArUpDMv4wluw6G+LdBlGEO16nO+gnNuKUArbmc=
+github.com/elastic/apm-data v1.19.5/go.mod h1:jfJZw+SiGv0y5jIeAjmzIxixRIfLuWREOYgNvmhcek8=
 github.com/elastic/azure-sdk-for-go/sdk/resourcemanager/consumption/armconsumption v1.1.0-elastic h1:fxOiGmMPr1dVDAKRGOkp9MV2amPmaZrWPtWJygFxcG0=
 github.com/elastic/azure-sdk-for-go/sdk/resourcemanager/consumption/armconsumption v1.1.0-elastic/go.mod h1:0vCBR1wgGwZeGmloJ+eCWIZF2S47grTXRzj2mftg2Nk=
 github.com/elastic/bayeux v1.0.5 h1:UceFq01ipmT3S8DzFK+uVAkbCdiPR0Bqei8qIGmUeY0=
@@ -587,8 +587,8 @@ github.com/elastic/opentelemetry-collector-components/processor/elastictraceproc
 github.com/elastic/opentelemetry-collector-components/processor/elastictraceprocessor v0.13.0/go.mod h1:W5d/R5og+IInD86ZCZQTSQhfQAJwuKSAzRO9EfnqDFM=
 github.com/elastic/opentelemetry-collector-components/processor/lsmintervalprocessor v0.8.0 h1:m2RieHXVTRykAd7VdpryuAV56Ia/eidgtlEutnG/m5w=
 github.com/elastic/opentelemetry-collector-components/processor/lsmintervalprocessor v0.8.0/go.mod h1:uQHpGpKwGHhdO5fm2hx1mthiPMiScmFOp5XNwD0EqVw=
-github.com/elastic/opentelemetry-collector-components/receiver/elasticapmintakereceiver v0.4.0 h1:uMnL1EaQtmdCrtgv31b3QKLxvb+FP6dOHneF/9aDkzI=
-github.com/elastic/opentelemetry-collector-components/receiver/elasticapmintakereceiver v0.4.0/go.mod h1:gRgnOTENLyQ6HXJX8L014J05EdEwacD4GC0VIfKnXKA=
+github.com/elastic/opentelemetry-collector-components/receiver/elasticapmintakereceiver v0.20.0 h1:ND1kfha7LyZTYJC8mrNLB9Pib9vdE+em6Nkc4B2IlWQ=
+github.com/elastic/opentelemetry-collector-components/receiver/elasticapmintakereceiver v0.20.0/go.mod h1:xWUNw7RTzuh7GPNtfBGsa/wRYTU3jUraXo362gsMCVg=
 github.com/elastic/opentelemetry-lib v0.25.0 h1:xEfAdJ/CqfFB25jN47kBp2OuN3jTdnNlMNvAHVBkWoY=
 github.com/elastic/opentelemetry-lib v0.25.0/go.mod h1:vpL8Tz372e0QfUlFSpv9to+HGKgW3SL913zVz0gReck=
 github.com/elastic/pkcs8 v1.0.0 h1:HhitlUKxhN288kcNcYkjW6/ouvuwJWd9ioxpjnD9jVA=
@@ -1859,8 +1859,8 @@ go.opentelemetry.io/collector/receiver/nopreceiver v0.137.0 h1:TcdoajoKEZyB5Aysf
 go.opentelemetry.io/collector/receiver/nopreceiver v0.137.0/go.mod h1:B16ZGJQuAU4o3UHwv8n/kgpfG8YjIGQq1fex+9UgZKE=
 go.opentelemetry.io/collector/receiver/otlpreceiver v0.137.0 h1:D4uTMOfluiksOJKrkp0+6xS4ksd2NlGNvraqC4XnsQQ=
 go.opentelemetry.io/collector/receiver/otlpreceiver v0.137.0/go.mod h1:y+2cry3yJtHOlaJlcuT2gaSbVDj7cBawwxE9jqoe8qg=
-go.opentelemetry.io/collector/receiver/receiverhelper v0.137.0 h1:+ybgvws1TtJoNcP7hJCo+fjk/WX2o26j7Bwr3b8429E=
-go.opentelemetry.io/collector/receiver/receiverhelper v0.137.0/go.mod h1:LySzuwJkntjxdPwFSs6xGc+UPBnw9BuznNOV4elYkNg=
+go.opentelemetry.io/collector/receiver/receiverhelper v0.138.0 h1:aEgyMilBJ2FoWQ+U4m28lzjmTP2UteDAIO96jRsPHmM=
+go.opentelemetry.io/collector/receiver/receiverhelper v0.138.0/go.mod h1:WxMvaPgL9MWrIKjDiZ/SmopEXAX+sO9CD/SfXI9J63A=
 go.opentelemetry.io/collector/receiver/receivertest v0.138.0 h1:K6kZ/epuAjjCCr1UMzNFyx1rynFSc+ifMXt5C/hWcXI=
 go.opentelemetry.io/collector/receiver/receivertest v0.138.0/go.mod h1:p3cGSplwwp71r7R6u0e8N0rP/mmPsFjJ4WFV2Bhv7os=
 go.opentelemetry.io/collector/receiver/xreceiver v0.138.0 h1:wspJazZc4htPBT08JpUI6gq+qeUUxSOhxXwWGn+QnlM=
