@@ -571,8 +571,8 @@ github.com/elastic/opentelemetry-collector-components/connector/profilingmetrics
 github.com/elastic/opentelemetry-collector-components/connector/profilingmetricsconnector v0.1.0/go.mod h1:bLOp7d7MO7HZijUzCTWYncehrAt2aFTtciIc412oops=
 github.com/elastic/opentelemetry-collector-components/extension/apikeyauthextension v0.8.0 h1:hcPCzE2cTSLn+TgyG6HSZN2fr2ynAmZVBF4nvRl/djI=
 github.com/elastic/opentelemetry-collector-components/extension/apikeyauthextension v0.8.0/go.mod h1:QwZvlsuE/atVWT25NSK5HyjjSlvDtER4tw4cf7d0fv0=
-github.com/elastic/opentelemetry-collector-components/extension/apmconfigextension v0.8.0 h1:7Pwsi9TuZGtLY5d0CuWBQs4x2PeM2QzYX/JLI8hcD3E=
-github.com/elastic/opentelemetry-collector-components/extension/apmconfigextension v0.8.0/go.mod h1:dTcHKkgdlx5P0Dn05bXhS30/70iZ8AbYm6SMnXA9He0=
+github.com/elastic/opentelemetry-collector-components/extension/apmconfigextension v0.20.0 h1:4GpzYUJ19NlZOMTIHmQteS8aPlMw4HtghTs6ZQazuwo=
+github.com/elastic/opentelemetry-collector-components/extension/apmconfigextension v0.20.0/go.mod h1:59hSAPa2E94W/Nb2WhkXL1FaBQwtZgR3DxwS1lckNw8=
 github.com/elastic/opentelemetry-collector-components/extension/beatsauthextension v0.5.0 h1:Mc3Qa3ck/jX+E2wqWdobPHqwJEqhzy4Qr2vsuFMezK8=
 github.com/elastic/opentelemetry-collector-components/extension/beatsauthextension v0.5.0/go.mod h1:8uY2S9yRlMBrd9XhW6eCHtnBSBpFslFjxiDcxRglER8=
 github.com/elastic/opentelemetry-collector-components/internal/sharedcomponent v0.0.0-20250220025958-386ba0c4bced h1:XcWi/S3OoeE5Qwmj381AoO3nr3AVXl4Z4QO0mqyjlzU=
@@ -1803,8 +1803,8 @@ go.opentelemetry.io/collector/extension/extensionmiddleware v0.138.0 h1:e80GXYoQ
 go.opentelemetry.io/collector/extension/extensionmiddleware v0.138.0/go.mod h1:/ub63cgY3YraiJJ3pBuxDnxEzeEXqniuRDQYf6NIBDE=
 go.opentelemetry.io/collector/extension/extensionmiddleware/extensionmiddlewaretest v0.138.0 h1:A574ECis4EzO5Yq+u4lUfZDXiYrSco4A0XtOte6DCvY=
 go.opentelemetry.io/collector/extension/extensionmiddleware/extensionmiddlewaretest v0.138.0/go.mod h1:sx6H9WWy0IyXmeR1ZRSlFA8WCNATtmPUCb5C1+2XdVw=
-go.opentelemetry.io/collector/extension/extensiontest v0.137.0 h1:gnPF3HIOKqNk93XObt2x0WFvVfPtm76VggWe7LxgcaY=
-go.opentelemetry.io/collector/extension/extensiontest v0.137.0/go.mod h1:vVmKojdITYka9+iAi3aarxeMrO6kdlywKuf3d3c6lcI=
+go.opentelemetry.io/collector/extension/extensiontest v0.138.0 h1:YyMrXjGleqfwXcFIxfdHP8F8QFQDSyoZiEji4LEteDA=
+go.opentelemetry.io/collector/extension/extensiontest v0.138.0/go.mod h1:pNvTqjxoJQQzT/qgjZEA46PBQDiyb3PZ3vATpCSfOE4=
 go.opentelemetry.io/collector/extension/memorylimiterextension v0.137.0 h1:Ar+fFe4q1mTMUG6QsRLFS+Ln5zIRxBBwMI9Glc7FI2E=
 go.opentelemetry.io/collector/extension/memorylimiterextension v0.137.0/go.mod h1:kDxCUZDDREdrAYfFSHC7eH9E+T1NvL1AaCZ9Jm84G3U=
 go.opentelemetry.io/collector/extension/xextension v0.137.0 h1:UQ/I7D5/YmkvAV7g8yhWHY7BV31HvjGBCYduQJPyt+M=
