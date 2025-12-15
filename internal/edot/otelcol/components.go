@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/otelcol"
 	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
 	// Receivers:
 	apachereceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/apachereceiver"
@@ -33,6 +34,7 @@ import (
 	redisreceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver"
 	sqlserverreceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/sqlserverreceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowseventlogreceiver"
+	windowsperfcountersreceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver"
 	zipkinreceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/zipkinreceiver"
 	nopreceiver "go.opentelemetry.io/collector/receiver/nopreceiver"
 	otlpreceiver "go.opentelemetry.io/collector/receiver/otlpreceiver"
@@ -101,7 +103,9 @@ import (
 func components(extensionFactories ...extension.Factory) func() (otelcol.Factories, error) {
 	return func() (otelcol.Factories, error) {
 		var err error
-		factories := otelcol.Factories{}
+		factories := otelcol.Factories{
+			Telemetry: otelconftelemetry.NewFactory(),
+		}
 
 		// Receivers
 		receivers := []receiver.Factory{
@@ -131,6 +135,7 @@ func components(extensionFactories ...extension.Factory) func() (otelcol.Factori
 			sqlserverreceiver.NewFactory(),
 			windowseventlogreceiver.NewFactory(),
 			awss3receiver.NewFactory(),
+			windowsperfcountersreceiver.NewFactory(),
 		}
 
 		// some receivers are only available on certain OS.
