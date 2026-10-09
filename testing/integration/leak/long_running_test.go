@@ -35,6 +35,7 @@ import (
 	atesting "github.com/elastic/elastic-agent/pkg/testing"
 	"github.com/elastic/elastic-agent/pkg/testing/define"
 	"github.com/elastic/elastic-agent/pkg/testing/tools"
+	"github.com/elastic/elastic-agent/pkg/testing/tools/fleettools"
 	"github.com/elastic/elastic-agent/pkg/utils"
 	"github.com/elastic/elastic-agent/testing/integration"
 	"github.com/elastic/go-sysinfo"
@@ -84,13 +85,26 @@ func TestLongRunningAgentForLeaks(t *testing.T) {
 }
 
 func (runner *ExtendedRunner) SetupSuite() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(runner.T().Context(), 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "install", "-v", "github.com/mingrammer/flog@latest")
-	out, err := cmd.CombinedOutput()
+	// Retry the install: a transient module proxy or network failure here
+	// would otherwise abort the whole suite.
+	var out []byte
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			runner.T().Logf("go install flog failed (attempt %d/3), retrying: %s", attempt-1, err)
+			time.Sleep(10 * time.Second)
+		}
+		cmd := exec.CommandContext(ctx, "go", "install", "-v", "github.com/mingrammer/flog@v0.4.4")
+		out, err = cmd.CombinedOutput()
+		if err == nil {
+			break
+		}
+	}
 	require.NoError(runner.T(), err, "got out: %s", string(out))
 
-	cmd = exec.CommandContext(ctx, "flog", "-t", "log", "-f", "apache_error", "-o", "/var/log/httpd/error_log", "-b", "50485760", "-p", "1048576")
+	cmd := exec.CommandContext(ctx, "flog", "-t", "log", "-f", "apache_error", "-o", "/var/log/httpd/error_log", "-b", "50485760", "-p", "1048576")
 	out, err = cmd.CombinedOutput()
 	require.NoError(runner.T(), err, "got out: %s", string(out))
 
@@ -115,6 +129,7 @@ func (runner *ExtendedRunner) SetupSuite() {
 		},
 	}
 
+	require.NoError(runner.T(), fleettools.UpdateESOutputPreset(ctx, runner.info.KibanaClient, fleettools.DefaultFleetOutputID, fleettools.OutputPresetLatency))
 	policyResp, _, err := tools.InstallAgentWithPolicy(ctx, runner.T(), installOpts, runner.agentFixture, runner.info.KibanaClient, basePolicy)
 	require.NoError(runner.T(), err)
 
@@ -143,7 +158,7 @@ func (runner *ExtendedRunner) SetupSuite() {
 }
 
 func (runner *ExtendedRunner) TestHandleLeak() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeout(runner.T().Context(), time.Hour)
 	defer cancel()
 
 	testRuntime := os.Getenv("LONG_TEST_RUNTIME")
@@ -168,14 +183,17 @@ func (runner *ExtendedRunner) TestHandleLeak() {
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
 
+	// Use a consecutive health checker so that transient recoverable degraded
+	// states (e.g. system.cpu on Windows) do not immediately fail the test.
+	healthChecker := atesting.NewConsecutiveHealthChecker(runner.agentFixture, 3)
+
 	done := false
 	for !done {
 		select {
 		case <-timer.C:
 			done = true
 		case <-ticker.C:
-			err := runner.agentFixture.IsHealthy(ctx)
-			require.NoError(runner.T(), err)
+			require.NoError(runner.T(), healthChecker.Check(ctx))
 			// iterate through our watchers, update them
 			for _, mon := range runner.resourceWatchers {
 				mon.Update(runner.T(), runner.agentFixture)
@@ -295,7 +313,16 @@ func (gm *goroutinesMonitor) Init(ctx context.Context, t *testing.T, fixture *at
 		t.Logf("agent status returned an error: %v", err)
 	}
 
+	pidInStatusMessageRegex := regexp.MustCompile(`[\d]+`)
 	for _, comp := range status.Components {
+		pidStr := pidInStatusMessageRegex.FindString(comp.Message)
+		if pidStr == "" {
+			// OTel receivers run inside the agent process rather than as
+			// standalone beat processes, so they don't expose a /stats unix
+			// socket endpoint. Skip them.
+			continue
+		}
+
 		unitId := comp.ID
 		socketPath := utils.SocketURLWithFallback(unitId, paths.TempDir())
 		handlesReg := tools.NewSlope(comp.Name)
@@ -307,7 +334,7 @@ func (gm *goroutinesMonitor) Init(ctx context.Context, t *testing.T, fixture *at
 					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 						if runtime.GOOS != "windows" {
 							path := strings.ReplaceAll(socketPath, "unix://", "")
-							return net.Dial("unix", path)
+							return (&net.Dialer{}).DialContext(ctx, "unix", path)
 						} else {
 							if strings.HasPrefix(socketPath, "npipe:///") {
 								path := strings.TrimPrefix(socketPath, "npipe:///")
@@ -330,7 +357,9 @@ func (gm *goroutinesMonitor) Init(ctx context.Context, t *testing.T, fixture *at
 func (gm *goroutinesMonitor) Update(t *testing.T, fixture *atesting.Fixture) {
 	// reach out to the unix sockets to get the raw stats that includes a count of gorutines
 	for _, comp := range gm.handles {
-		resp, err := comp.httpClient.Get("http://unix/stats")
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://unix/stats", nil)
+		require.NoError(t, err)
+		resp, err := comp.httpClient.Do(req)
 		require.NoError(t, err)
 		respRaw, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)

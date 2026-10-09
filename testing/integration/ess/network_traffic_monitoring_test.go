@@ -8,20 +8,29 @@ package ess
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"net"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofrs/uuid/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/elastic/elastic-agent-libs/kibana"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/elastic-agent-libs/testing/estools"
+	"github.com/elastic/elastic-agent/pkg/component"
+	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
 	atesting "github.com/elastic/elastic-agent/pkg/testing"
 	"github.com/elastic/elastic-agent/pkg/testing/define"
 	"github.com/elastic/elastic-agent/pkg/testing/tools"
+	"github.com/elastic/elastic-agent/pkg/testing/tools/fleettools"
 	"github.com/elastic/elastic-agent/testing/integration"
 )
 
@@ -30,12 +39,15 @@ type NetworkTrafficRunner struct {
 	info         *define.Info
 	agentFixture *atesting.Fixture
 
-	ESHost string
+	ESHost     string
+	agentID    string
+	policyID   string
+	policyName string
 }
 
 func TestNetworkTraffic(t *testing.T) {
 	info := define.Require(t, define.Requirements{
-		Group: integration.Fleet,
+		Group: integration.FleetProxy,
 		Stack: &define.Stack{},
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
@@ -43,6 +55,10 @@ func TestNetworkTraffic(t *testing.T) {
 			{Type: define.Linux},
 			{Type: define.Windows},
 		},
+		// Packetbeat cannot load wpcap.dll on windows/arm64 because npcap is
+		// bundled only in the windows/amd64 package.
+		// TODO: remove this skip when https://github.com/elastic/elastic-agent/issues/17044 is resolved.
+		SkipOS: []define.OS{{Type: define.Windows, Arch: define.ARM64}},
 	})
 
 	suite.Run(t, &NetworkTrafficRunner{info: info})
@@ -70,11 +86,18 @@ func (runner *NetworkTrafficRunner) SetupSuite() {
 		Privileged:     true,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// 5 minutes: agent install can take 2+ minutes on slow machines, leaving
+	// insufficient time for the subsequent package install with a 3-minute budget.
+	ctx, cancel := context.WithTimeout(runner.T().Context(), 5*time.Minute)
 	defer cancel()
 
-	policyResp, _, err := tools.InstallAgentWithPolicy(ctx, runner.T(), installOpts, runner.agentFixture, runner.info.KibanaClient, basePolicy)
+	require.NoError(runner.T(), fleettools.UpdateESOutputPreset(ctx, runner.info.KibanaClient, fleettools.DefaultFleetOutputID, fleettools.OutputPresetLatency))
+	policyResp, agentID, err := tools.InstallAgentWithPolicy(ctx, runner.T(), installOpts, runner.agentFixture, runner.info.KibanaClient, basePolicy)
 	require.NoError(runner.T(), err)
+
+	runner.agentID = agentID
+	runner.policyID = policyResp.ID
+	runner.policyName = policyResp.Name
 
 	packageFile := filepath.Join("testdata", "network_traffic_package.json")
 	_, err = tools.InstallPackageFromDefaultFile(ctx, runner.info.KibanaClient, "network_traffic",
@@ -83,22 +106,17 @@ func (runner *NetworkTrafficRunner) SetupSuite() {
 
 }
 
-func (runner *NetworkTrafficRunner) TestBeatsMetrics() {
-	t := runner.T()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
-	defer cancel()
-
-	agentStatus, err := runner.agentFixture.ExecStatus(ctx)
-	require.NoError(t, err, "could not to get agent status")
-
+// validateNetworkTrafficEvents generates TLS traffic to serverName:port and returns
+// the captured event for it. Traffic is generated on every poll so a missed
+// capture is retried rather than failing the test.
+func (runner *NetworkTrafficRunner) validateNetworkTrafficEvents(t *testing.T, ctx context.Context, agentID, serverName, port string, since time.Time) mapstr.M {
 	now := time.Now()
 	var query map[string]any
+	var doc mapstr.M
 	defer func() {
 		if t.Failed() {
 			bs, err := json.Marshal(query)
 			if err != nil {
-				// nothing we can do, just log the map
 				t.Errorf("executed at %s: %v",
 					now.Format(time.RFC3339Nano), query)
 				return
@@ -108,18 +126,104 @@ func (runner *NetworkTrafficRunner) TestBeatsMetrics() {
 		}
 	}()
 
-	t.Logf("starting to ES for metrics at %s", now.Format(time.RFC3339Nano))
-	require.Eventually(t, func() bool {
-		query = genESQuery(agentStatus.Info.ID,
+	t.Logf("starting to query ES for network traffic events at %s", now.Format(time.RFC3339Nano))
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		dialTLS(t, ctx, serverName, port)
+
+		query = genESQuery(agentID,
 			[][]string{
-				{"exists", "field", "tls.client.server_name"},
+				{"match", "tls.client.server_name", serverName},
 			})
+		query["query"].(map[string]interface{})["bool"].(map[string]interface{})["filter"] = map[string]any{
+			"range": map[string]any{
+				"@timestamp": map[string]any{"gte": since.UTC().Format("2006-01-02T15:04:05.000Z")},
+			},
+		}
+		query["sort"] = []map[string]any{{"@timestamp": map[string]any{"order": "asc"}}}
 		now = time.Now()
 		res, err := estools.PerformQueryForRawQuery(ctx, query, "logs-network_traffic.tls*", runner.info.ESClient)
-		require.NoError(t, err)
-		if res.Hits.Total.Value < 1 {
-			return false
-		}
-		return true
-	}, time.Minute*10, time.Second*10, "could not fetch events for network_traffic")
+		require.NoError(collect, err)
+		require.NotEmpty(collect, res.Hits.Hits)
+		doc = mapstr.M(res.Hits.Hits[0].Source)
+	}, time.Minute*10, time.Second*10, "could not fetch events for network_traffic to %s", serverName)
+	return doc
+}
+
+// dialTLS triggers a TLS handshake to host:port for the packet component to
+// capture. A dial error is fine: the SNI is sent before cert verification.
+func dialTLS(t *testing.T, ctx context.Context, host, port string) {
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 10 * time.Second},
+		Config:    &tls.Config{ServerName: host},
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		t.Logf("TLS dial to %s:%s returned %v (handshake still captured)", host, port, err)
+		return
+	}
+	_ = conn.Close()
+}
+
+func (runner *NetworkTrafficRunner) TestBeatsMetrics() {
+	t := runner.T()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute*20)
+	defer cancel()
+
+	agentStatus, err := runner.agentFixture.ExecStatus(ctx)
+	require.NoError(t, err, "could not get agent status")
+
+	// Use one fixed destination for both runtimes so the captured handshakes are
+	// directly comparable. Use the actual port from ELASTICSEARCH_HOST so that
+	// the TLS dial succeeds on local stacks (port 9200) as well as ESS (port 443).
+	rawESHost, err := integration.GetESHost()
+	require.NoError(t, err, "could not get ES host")
+	esURL, err := url.Parse(rawESHost)
+	require.NoError(t, err, "could not parse ES host URL")
+	serverName := esURL.Hostname()
+	port := esURL.Port()
+	if port == "" {
+		port = "443"
+	}
+
+	var processDoc mapstr.M
+	t.Run("process", func(t *testing.T) {
+		processDoc = runner.validateNetworkTrafficEvents(t, ctx, agentStatus.Info.ID, serverName, port, time.Now())
+	})
+
+	var otelDoc mapstr.M
+	t.Run("otel", func(t *testing.T) {
+		otelSince := time.Now()
+		policyRevision := switchPolicyToOtelRuntime(ctx, t, runner.info.KibanaClient, runner.policyID, runner.policyName, runner.info.Namespace)
+
+		require.Eventually(t, tools.IsPolicyRevision(ctx, t, runner.info.KibanaClient, runner.agentID, policyRevision),
+			5*time.Minute, time.Second)
+
+		// The packet component may take a moment to appear after the policy switch.
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
+			status, statusErr := runner.agentFixture.ExecStatus(ctx)
+			require.NoError(collect, statusErr)
+			var foundReceiver bool
+			for _, comp := range status.Components {
+				if strings.HasPrefix(comp.ID, "packet") &&
+					comp.VersionInfo.Name == componentVersionInfoNameForRuntime(component.OtelRuntimeManager) {
+					compStateProto := cproto.State(comp.State) //nolint:gosec // guaranteed to be valid
+					assert.Equal(collect, cproto.State_HEALTHY, compStateProto,
+						"expected packet component to be healthy, got %s", compStateProto)
+					foundReceiver = true
+					break
+				}
+			}
+			assert.True(collect, foundReceiver, "expected a packet (network_traffic) component to be running as beats receiver")
+		}, 2*time.Minute, 5*time.Second, "beat component should be running as beats receiver")
+
+		otelDoc = runner.validateNetworkTrafficEvents(t, ctx, agentStatus.Info.ID, serverName, port, otelSince)
+	})
+
+	t.Run("compare", func(t *testing.T) {
+		require.NotNil(t, processDoc, "process subtest did not produce a document")
+		require.NotNil(t, otelDoc, "otel subtest did not produce a document")
+		AssertMapstrKeysEqual(t, processDoc, otelDoc, RuntimeComparisonIgnoredFields,
+			"expected network_traffic document keys to be equal between process and otel modes")
+	})
 }

@@ -8,10 +8,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
-	"syscall"
+
+	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 
 	"github.com/elastic/elastic-agent/internal/pkg/otel"
+	"github.com/elastic/elastic-agent/internal/pkg/otel/translate"
 
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/component/runtime"
@@ -68,7 +71,6 @@ func (m *OTelManager) PerformDiagnostics(ctx context.Context, req ...runtime.Com
 			}
 		}
 	}
-
 	return diagnostics
 }
 
@@ -93,7 +95,6 @@ func (m *OTelManager) PerformComponentDiagnostics(
 		compByID[comp.ID] = comp
 	}
 
-	// create empty diagnostics for components that exist in the manager
 	for _, existingComp := range currentComponents {
 		if inputComp, ok := compByID[existingComp.ID]; ok {
 			diagnostics = append(diagnostics, runtime.ComponentDiagnostic{
@@ -105,30 +106,98 @@ func (m *OTelManager) PerformComponentDiagnostics(
 	}
 
 	extDiagnostics, err := otel.PerformDiagnosticsExt(ctx, false)
-
-	// We're not running the EDOT if:
-	//  1. Either the socket doesn't exist
-	//	2. It is refusing the connections.
-	// Return error for any other scenario.
 	if err != nil {
-		m.managerLogger.Debugf("Couldn't fetch diagnostics from EDOT: %v", err)
-		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
-			return nil, fmt.Errorf("error fetching otel diagnostics: %w", err)
-		}
-	}
-
-	for idx, diag := range diagnostics {
-		found := false
-		for _, extDiag := range extDiagnostics.ComponentDiagnostics {
-			if strings.Contains(extDiag.Name, diag.Component.ID) {
-				found = true
-				diagnostics[idx].Results = append(diagnostics[idx].Results, extDiag)
+		// otel.IsCollectorUnavailable covers the socket being missing or refusing
+		// connections, both of which mean the collector isn't running, which is
+		// expected. context.DeadlineExceeded is additionally treated the same way
+		// here for a Windows-specific case: a pipe-busy dial timing out. This is
+		// defensive: production does not set a dial deadline, so this only fires
+		// if the caller passes one.
+		// Any other error is unexpected, so surface it on each component so it ends up in the diagnostics archive.
+		if otel.IsCollectorUnavailable(err) || errors.Is(err, context.DeadlineExceeded) {
+			m.managerLogger.Debugf("collector not reachable, no diagnostics available: %v", err)
+		} else {
+			m.managerLogger.Warnf("failed to fetch diagnostics from collector: %v", err)
+			for idx := range diagnostics {
+				diagnostics[idx].Err = fmt.Errorf("error fetching otel diagnostics: %w", err)
 			}
 		}
-		if !found {
-			diagnostics[idx].Err = fmt.Errorf("failed to get diagnostics for %s", diag.Component.ID)
+		return diagnostics, nil
+	}
+
+	diagIdxByCompID := make(map[string]int)
+	for idx, diag := range diagnostics {
+		diagIdxByCompID[diag.Component.ID] = idx
+	}
+	for _, extDiag := range extDiagnostics.ComponentDiagnostics {
+		componentIDs := diagnosticComponentIDsFromName(extDiag.Name, currentComponents)
+		if len(componentIDs) == 0 {
+			m.managerLogger.Debugf("skipping EDOT diagnostic for %q: it cannot be associated with an active component", extDiag.Name)
+			continue
+		}
+		if len(componentIDs) > 1 {
+			m.managerLogger.Warnf("EDOT diagnostic %q is associated with multiple components %q; preserving it for each component", extDiag.Name, componentIDs)
+		}
+		for _, compID := range componentIDs {
+			if idx, ok := diagIdxByCompID[compID]; ok {
+				if result := streamPrefixedDiagnostic(extDiag, streamIDForComponent(extDiag.Name, compID)); result != nil {
+					diagnostics[idx].Results = append(diagnostics[idx].Results, result)
+				}
+			}
 		}
 	}
 
 	return diagnostics, nil
+}
+
+// diagnosticComponentIDsFromName matches the receiver type and treats component
+// IDs as opaque candidates, without attempting to split out a stream ID. More
+// than one same-type match is retained so diagnostics remain lossless when
+// component and stream IDs make the flattened receiver name ambiguous.
+func diagnosticComponentIDsFromName(name string, components []component.Component) []string {
+	receiverType, suffix, found := strings.Cut(name, "/"+translate.OtelNamePrefix)
+	if !found {
+		return nil
+	}
+
+	componentIDs := make([]string, 0, 1)
+	for _, comp := range components {
+		beatName := comp.BeatName()
+		if beatName == "" || receiverType != beatName+"receiver" {
+			continue
+		}
+		if suffix == comp.ID || strings.HasPrefix(suffix, comp.ID+"/") {
+			componentIDs = append(componentIDs, comp.ID)
+		}
+	}
+	slices.Sort(componentIDs)
+	return componentIDs
+}
+
+// streamIDForComponent returns the receiver-name suffix after the component ID.
+func streamIDForComponent(name, compID string) string {
+	_, suffix, found := strings.Cut(name, "/"+translate.OtelNamePrefix)
+	if !found || suffix == "" || suffix == compID {
+		return ""
+	}
+	return strings.TrimPrefix(suffix, compID+"/")
+}
+
+// streamPrefixedDiagnostic returns a copy of res whose Filename is prefixed
+// with streamID. Empty IDs and the single_receiver placeholder are left
+// unprefixed so files stay at components/<compID>/. A policy stream whose ID
+// is also "single" would skip the subdir the same way.
+func streamPrefixedDiagnostic(res *proto.ActionDiagnosticUnitResult, streamID string) *proto.ActionDiagnosticUnitResult {
+	if res == nil || streamID == "" || streamID == translate.SingleReceiverStreamID {
+		return res
+	}
+
+	return &proto.ActionDiagnosticUnitResult{
+		Name:        res.GetName(),
+		Filename:    strings.ReplaceAll(streamID, "/", "-") + "/" + res.GetFilename(),
+		Description: res.GetDescription(),
+		ContentType: res.GetContentType(),
+		Content:     res.GetContent(),
+		Generated:   res.GetGenerated(),
+	}
 }

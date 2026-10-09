@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -24,14 +25,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
+	"github.com/elastic/elastic-agent-libs/logp"
+
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/install"
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/control"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
 	"github.com/elastic/elastic-agent/pkg/core/process"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 )
 
 // Fixture handles the setup and management of the Elastic Agent.
@@ -52,6 +55,11 @@ type Fixture struct {
 	runLength       time.Duration
 	additionalArgs  []string
 	fipsArtifact    bool
+	cmdOutput       io.Writer
+
+	// useStandardCheckinMode disables the on_state_change Fleet checkin
+	// mode used in tests by default.
+	useStandardCheckinMode bool
 
 	srcPackage string
 	workDir    string
@@ -120,6 +128,16 @@ func WithLogOutput() FixtureOpt {
 	}
 }
 
+// WithCmdOutput configures a writer that receives a combined copy of stdout and
+// stderr from the spawned process started by Run/RunOtelWithClient/RunBeat.
+// Writes from the stdout and stderr goroutines are serialized internally so the
+// supplied writer does not need to be safe for concurrent use.
+func WithCmdOutput(w io.Writer) FixtureOpt {
+	return func(f *Fixture) {
+		f.cmdOutput = w
+	}
+}
+
 // WithAllowErrors instructs the fixture to allow the Elastic Agent to log errors.
 // By default, the Fixture will not allow the Elastic Agent to log any errors, logging any error
 // will result on the Fixture to kill the Elastic Agent and report it as an error.
@@ -157,9 +175,25 @@ func WithAdditionalArgs(args []string) FixtureOpt {
 	}
 }
 
+// WithAppendAdditionalArgs appends to any additional args already set on the fixture.
+func WithAppendAdditionalArgs(args []string) FixtureOpt {
+	return func(f *Fixture) {
+		f.additionalArgs = append(f.additionalArgs, args...)
+	}
+}
+
 func WithFIPSArtifact() FixtureOpt {
 	return func(f *Fixture) {
 		f.fipsArtifact = true
+	}
+}
+
+// WithStandardCheckinMode opts the fixture out of the default on_state_change
+// Fleet checkin mode. Use this when a test specifically requires standard
+// checkin behavior where changes can take up to 5 minutes to be reported to Fleet.
+func WithStandardCheckinMode() FixtureOpt {
+	return func(f *Fixture) {
+		f.useStandardCheckinMode = true
 	}
 }
 
@@ -454,7 +488,7 @@ func (f *Fixture) RunBeat(ctx context.Context) error {
 		f.binaryPath(),
 		process.WithContext(ctx),
 		process.WithArgs(args),
-		process.WithCmdOptions(attachOutErr(stdOut, stdErr)))
+		process.WithCmdOptions(attachOutErr(stdOut, stdErr, f.cmdOutput)))
 	if err != nil {
 		return fmt.Errorf("failed to spawn %s: %w", f.binaryName, err)
 	}
@@ -527,7 +561,7 @@ func RunProcess(t *testing.T,
 		processPath,
 		process.WithContext(ctx),
 		process.WithArgs(args),
-		process.WithCmdOptions(attachOutErr(stdOut, stdErr)))
+		process.WithCmdOptions(attachOutErr(stdOut, stdErr, nil)))
 	if err != nil {
 		return fmt.Errorf("failed to spawn %q: %w", processPath, err)
 	}
@@ -592,25 +626,25 @@ func RunProcess(t *testing.T,
 // when `Run` is called.
 //
 // if shouldWatchState is set to false, communicating state does not happen.
-func (f *Fixture) RunOtelWithClient(ctx context.Context, states ...State) error {
-	return f.executeWithClient(ctx, "otel", false, false, false, states...)
+func (f *Fixture) RunOtelWithClient(ctx context.Context) error {
+	return f.executeWithClient(ctx, "otel", false, false, false)
 }
 
 // Stop gracefully stops the Elastic Agent process that has been started
 // by [RunOtelWithCliet] or [Run].
 // If the Elastic Agent has been installed, or the process
 // has not been started by [RunOtelWithClient] or [Run],
-// Stop fails the test by calling t.Error
+// Stop fails the test by calling t.Fatal
 func (f *Fixture) Stop() {
 	f.procMutex.Lock()
 	defer f.procMutex.Unlock()
 
 	if f.installed {
-		f.t.Error("an installed Elastic Agent cannot be stopped")
+		f.t.Fatal("an installed Elastic Agent cannot be stopped")
 	}
 
 	if f.proc == nil {
-		f.t.Error("Elastic Agent has not been started")
+		f.t.Fatal("Elastic Agent has not been started")
 	}
 
 	f.stopping = true
@@ -685,7 +719,7 @@ func (f *Fixture) executeWithClient(ctx context.Context, command string, disable
 		f.binaryPath(),
 		process.WithContext(ctx),
 		process.WithArgs(args),
-		process.WithCmdOptions(attachOutErr(stdOut, stdErr)))
+		process.WithCmdOptions(attachOutErr(stdOut, stdErr, f.cmdOutput)))
 	f.procMutex.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to spawn %s: %w", f.binaryName, err)
@@ -720,9 +754,21 @@ func (f *Fixture) executeWithClient(ctx context.Context, command string, disable
 			return ctx.Err()
 		case ps := <-procWaitCh:
 			if f.stopping {
+				if ps != nil {
+					// Log the exit code (decimal + hex) so callers can distinguish
+					// clean exits from Windows status codes (e.g. 0xC000013A =
+					// STATUS_CONTROL_C_EXIT) when the process was supposed to
+					// shut down gracefully but appears to have been terminated.
+					f.t.Logf("agent exited (after Stop): code=%d (0x%x)", ps.ExitCode(), uint32(ps.ExitCode())) //nolint:gosec // exit-code-to-uint32 is intentional for hex formatting
+				} else {
+					f.t.Logf("agent exited (after Stop): exit code unavailable")
+				}
 				return nil
 			}
-			return fmt.Errorf("elastic-agent exited unexpectedly with exit code: %d", ps.ExitCode())
+			if ps != nil {
+				return fmt.Errorf("elastic-agent exited unexpectedly with exit code: %d", ps.ExitCode())
+			}
+			return fmt.Errorf("elastic-agent exited unexpectedly: exit code unavailable")
 		case err := <-stdOut.Watch():
 			if !f.allowErrs {
 				// no errors allowed
@@ -1555,12 +1601,32 @@ func writeSpecFile(dest string, spec *component.Spec) error {
 }
 
 // attachOutErr attaches the logWatcher to std out and std error of the spawned process.
-func attachOutErr(stdOut *logWatcher, stdErr *logWatcher) process.CmdOption {
+// If extra is non-nil it receives a combined copy of stdout and stderr; writes from
+// the two streams are serialized so extra does not need to be safe for concurrent use.
+func attachOutErr(stdOut *logWatcher, stdErr *logWatcher, extra io.Writer) process.CmdOption {
 	return func(cmd *exec.Cmd) error {
 		cmd.Stdout = stdOut
 		cmd.Stderr = stdErr
+		if extra != nil {
+			synced := &syncWriter{w: extra}
+			cmd.Stdout = io.MultiWriter(stdOut, synced)
+			cmd.Stderr = io.MultiWriter(stdErr, synced)
+		}
 		return nil
 	}
+}
+
+// syncWriter serializes Write calls so the wrapped writer can be shared
+// between the stdout and stderr copy goroutines.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 func watchState(ctx context.Context, t *testing.T, c client.Client, timeout time.Duration) (chan *client.AgentState, chan error) {
@@ -1635,7 +1701,7 @@ func createTempDir(t *testing.T) string {
 
 	cleanup := func() {
 		if !t.Failed() {
-			if err := install.RemovePath(tempDir); err != nil {
+			if err := install.RemovePath(logp.NewNopLogger(), tempDir); err != nil {
 				t.Errorf("could not remove temp dir '%s': %s", tempDir, err)
 			}
 		} else {
@@ -1708,13 +1774,22 @@ func (aso *AgentStatusOutput) IsZero() bool {
 type AgentInspectOutput struct {
 	Agent struct {
 		Download struct {
-			SourceURI string `yaml:"sourceURI"`
+			Sources []string `yaml:"sources"`
 		} `yaml:"download"`
 		Features interface{} `yaml:"features"`
 		Headers  interface{} `yaml:"headers"`
 		ID       string      `yaml:"id"`
 		Logging  struct {
-			Level string `yaml:"level"`
+			Level    string `yaml:"level"`
+			ToFiles  bool   `yaml:"to_files"`
+			ToStderr bool   `yaml:"to_stderr"`
+			Files    struct {
+				Path string `yaml:"path"`
+			} `yaml:"files"`
+			EventData struct {
+				ToFiles  bool `yaml:"to_files"`
+				ToStderr bool `yaml:"to_stderr"`
+			} `yaml:"event_data"`
 		} `yaml:"logging"`
 		Monitoring struct {
 			Enabled bool `yaml:"enabled"`

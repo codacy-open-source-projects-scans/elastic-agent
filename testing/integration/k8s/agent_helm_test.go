@@ -15,7 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"helm.sh/helm/v3/pkg/cli/values"
+	"helm.sh/helm/v4/pkg/cli/values"
 
 	"github.com/elastic/elastic-agent/pkg/testing/define"
 )
@@ -41,6 +41,21 @@ func TestKubernetesAgentHelmRotatedLogs(t *testing.T) {
 	require.NoError(t, err, "failed to compile rotated gzip regex")
 
 	kCtx := k8sGetContext(t, info)
+
+	rotatedExpected := []expectedLogFile{
+		{
+			regex:       plainRegex,
+			description: "plain text rotated log (" + plainRegex.String() + ")",
+		},
+	}
+
+	// Kind compresses rotated log files.
+	if !kCtx.openshift {
+		rotatedExpected = append(rotatedExpected, expectedLogFile{
+			regex:       gzRegex,
+			description: "gzipped rotated log (" + gzRegex.String() + ")",
+		})
+	}
 
 	defaultValues := values.Options{
 		ValueFiles: []string{"../../../deploy/helm/elastic-agent/values.yaml"},
@@ -111,14 +126,11 @@ func TestKubernetesAgentHelmRotatedLogs(t *testing.T) {
 		// 7th - verify rotated logs are ingested
 		k8sStepCheckLogFilesIngested(info,
 			"logs", "kubernetes.container_logs", "default", "/var/log/pods/*flog*",
-			expectedLogFile{regex: plainRegex,
-				description: "plain text rotated log (" + plainRegex.String() + ")"},
-			expectedLogFile{regex: gzRegex,
-				description: "gzipped rotated log (" + gzRegex.String() + ")"},
+			rotatedExpected...,
 		),
 	}
 
-	ctx := context.Background()
+	ctx := context.Background() //nolint:forbidigo // ctx is captured by t.Cleanup in step functions; must outlive the test
 	testNamespace := kCtx.getNamespace(t)
 
 	for _, step := range steps {

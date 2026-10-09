@@ -15,8 +15,6 @@ $PSVersionTable.PSVersion
 $packageVersionContent = Get-Content .package-version -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
 if ($packageVersionContent -and $packageVersionContent.stack_version ) {
     $STACK_VERSION = $packageVersionContent.stack_version
-}
-if ($packageVersionContent -and $packageVersionContent.stack_build_id ) {
     $STACK_BUILD_ID = $packageVersionContent.stack_build_id
 }
 
@@ -31,8 +29,15 @@ if ($LASTEXITCODE -ne 0) {
 $TestsExitCode = 0
 try {
     Write-Output "~~~ Running integration tests"
-    # Get-Ess-Stack will start the ESS stack if it is a BK retry, otherwise it will retrieve ESS stack metadata
+    # Get-Ess-Stack will start the ESS stack if it is a BK retry
     Get-Ess-Stack -StackVersion $STACK_VERSION -StackBuildId $STACK_BUILD_ID
+
+    # Load secrets from GCP Secret Manager via oblt-cli
+    $result = ess_load_secrets
+    if ($result -ne 0) {
+        Write-Output "Failed to load secrets"
+        exit 1
+    }
     & "$PWD\.buildkite\scripts\buildkite-integration-tests.ps1" $GROUP_NAME $TEST_SUDO
     $TestsExitCode = $LASTEXITCODE
     if ($TestsExitCode -ne 0)
@@ -41,8 +46,10 @@ try {
         Write-Output "Integration tests failed"
     }
 } finally {
-    # ess_down will destroy the ESS stack if tf state file is found, aka if this is a BK retry
-    ess_down
+    # ess_down will destroy the ESS stack if this is a BK retry (cluster was created in this step)
+    if ($Env:BUILDKITE_RETRY_COUNT -gt 0 -and $Env:BUILDKITE_RETRY_TYPE -ne "automatic") {
+        ess_down
+    }
 }
 
 exit $TestsExitCode

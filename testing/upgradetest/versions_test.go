@@ -688,6 +688,36 @@ func TestPreviousMinor(t *testing.T) {
 			upgradeableVersions: previousMinorVersions,
 			expected:            noPreviousMinorResult,
 		},
+		// IAR (independent artifact release) versions have build metadata matching ^build\d{12}.
+		// previousMinor must accept them, consistent with findRequiredVersions, because the
+		// automation that generates .upgrade-test-agent-versions.yml treats them as GA releases.
+		"Nth major Nth patch - only IAR previous minor versions": {
+			currentVersion: "9.2.15",
+			upgradeableVersions: []string{
+				"9.1.15+build202609161310",
+				"9.1.1+build202609161310",
+				"9.1.0+build202609161310",
+			},
+			expected: allSameResult("9.1.15+build202609161310", ""),
+		},
+		// Mix of IAR, plain GA, snapshots, and non-IAR build metadata versions.
+		// Mirrors the real shape of .upgrade-test-agent-versions.yml: IAR releases sit
+		// alongside snapshots and occasional plain GA entries. The highest version that is
+		// either a plain GA or an IAR should win; non-IAR build metadata and snapshots must
+		// be skipped.
+		"Nth major Nth patch - mixed IAR, plain GA, snapshot, and non-IAR metadata previous minor versions": {
+			currentVersion: "9.6.0",
+			upgradeableVersions: []string{
+				"9.5.4+build202609161310", // IAR — should be selected (highest eligible)
+				"9.5.4-SNAPSHOT",          // snapshot — skip
+				"9.5.4+arbitrarymeta",     // non-IAR build metadata — skip
+				"9.4.7",                   // plain GA — eligible but lower than IAR above
+				"9.4.7-SNAPSHOT",          // snapshot — skip
+				"8.19.22-SNAPSHOT",        // snapshot, wrong major — skip
+				"7.17.29",                 // plain GA, wrong major — skip
+			},
+			expected: allSameResult("9.5.4+build202609161310", ""),
+		},
 		"Empty version range": {
 			currentVersion:      "9.2.15",
 			upgradeableVersions: []string{},
@@ -756,4 +786,28 @@ func (f fetcherMock) FetchAgentVersions(ctx context.Context) (version.SortablePa
 
 func (f fetcherMock) FindLatestSnapshots(ctx context.Context, branches []string) (version.SortableParsedVersions, error) {
 	return f.list, nil
+}
+
+func TestSupportsUpgradeSourceOnPlatform(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		goos    string
+		goarch  string
+		want    bool
+	}{
+		{"windows/arm64 before 9.3.0 not supported", "9.2.8", "windows", "arm64", false},
+		{"windows/arm64 9.3.0 supported", "9.3.0", "windows", "arm64", true},
+		{"windows/arm64 after 9.3.0 supported", "9.4.1", "windows", "arm64", true},
+		{"windows/amd64 before 9.3.0 supported", "9.2.8", "windows", "amd64", true},
+		{"linux/arm64 before 9.3.0 supported", "9.2.8", "linux", "arm64", true},
+		{"darwin/arm64 before 9.3.0 supported", "9.2.8", "darwin", "arm64", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := version.ParseVersion(tc.version)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, SupportsUpgradeSourceOnPlatform(v, tc.goos, tc.goarch))
+		})
+	}
 }

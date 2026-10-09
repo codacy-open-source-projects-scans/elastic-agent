@@ -5,7 +5,6 @@
 package features
 
 import (
-	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -31,6 +30,10 @@ const defaultDefaultProcessors = true
 // 9.4 - disabled (plaintext config)
 const defaultEncryptedConfig = false
 
+// The default value for the include tags in events feature flag.
+// 9.6 - disabled
+const defaultIncludeTagsInEvents = false
+
 var (
 	current = Flags{
 		tamperProtection:  defaultTamperProtection,
@@ -51,6 +54,7 @@ type Flags struct {
 	disablePolicyChangeAcks bool
 	defaultProcessors       bool
 	encryptedConfig         bool
+	includeTagsInEvents     bool
 }
 
 type cfg struct {
@@ -71,6 +75,9 @@ type cfg struct {
 			EncryptedConfig *struct {
 				Enabled bool `json:"enabled" yaml:"enabled" config:"enabled"`
 			} `json:"encrypted_config" yaml:"encrypted_config" config:"encrypted_config"`
+			IncludeTagsInEvents *struct {
+				Enabled bool `json:"enabled" yaml:"enabled" config:"enabled"`
+			} `json:"include_tags_in_events,omitempty" yaml:"include_tags_in_events,omitempty" config:"include_tags_in_events,omitempty"`
 		} `json:"features" yaml:"features" config:"features"`
 	} `json:"agent" yaml:"agent" config:"agent"`
 }
@@ -108,6 +115,13 @@ func (f *Flags) EncryptedConfig() bool {
 	defer f.mu.RUnlock()
 
 	return f.encryptedConfig
+}
+
+func (f *Flags) IncludeTagsInEvents() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	return f.includeTagsInEvents
 }
 
 func (f *Flags) AsProto() *proto.Features {
@@ -186,20 +200,38 @@ func (f *Flags) setEncryptedConfig(newValue bool) {
 	f.encryptedConfig = newValue
 }
 
-// setSource sets the source from he given cfg.
-func (f *Flags) setSource(c cfg) error {
-	// Use JSON marshalling-unmarshalling to convert cfg to mapstr
-	data, err := json.Marshal(c)
-	if err != nil {
-		return fmt.Errorf("could not convert feature flags configuration to JSON: %w", err)
+func (f *Flags) setIncludeTagsInEvents(newValue bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.includeTagsInEvents = newValue
+}
+
+// setSource preserves the original agent.features subtree so consumers can
+// receive feature flags that are not represented by typed Agent fields.
+func (f *Flags) setSource(c *config.Config) error {
+	options := make([]interface{}, len(config.NoResolveOptions))
+	for i, option := range config.NoResolveOptions {
+		options[i] = option
 	}
 
-	var s map[string]interface{}
-	if err := json.Unmarshal(data, &s); err != nil {
-		return fmt.Errorf("could not convert feature flags JSON to mapstr: %w", err)
+	var policy map[string]any
+	if err := c.UnpackTo(&policy, options...); err != nil {
+		return fmt.Errorf("could not unpack feature flags source: %w", err)
 	}
 
-	source, err := structpb.NewStruct(s)
+	featureConfig := map[string]any{}
+	if agentConfig, ok := policy["agent"].(map[string]any); ok {
+		if configuredFeatures, ok := agentConfig["features"].(map[string]any); ok {
+			featureConfig = configuredFeatures
+		}
+	}
+
+	source, err := structpb.NewStruct(map[string]any{
+		"agent": map[string]any{
+			"features": featureConfig,
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("unable to create source from feature flags configuration: %w", err)
 	}
@@ -269,7 +301,13 @@ func Parse(policy any) (*Flags, error) {
 		flags.setEncryptedConfig(defaultEncryptedConfig)
 	}
 
-	if err := flags.setSource(parsedFlags); err != nil {
+	if parsedFlags.Agent.Features.IncludeTagsInEvents != nil {
+		flags.setIncludeTagsInEvents(parsedFlags.Agent.Features.IncludeTagsInEvents.Enabled)
+	} else {
+		flags.setIncludeTagsInEvents(defaultIncludeTagsInEvents)
+	}
+
+	if err := flags.setSource(c); err != nil {
 		return nil, fmt.Errorf("error creating feature flags source: %w", err)
 	}
 
@@ -294,6 +332,7 @@ func Apply(c *config.Config) error {
 	current.setDisablePolicyChangeAcks(parsed.DisablePolicyChangeAcks())
 	current.setDefaultProcessors(parsed.DefaultProcessors())
 	current.setEncryptedConfig(parsed.EncryptedConfig())
+	current.setIncludeTagsInEvents(parsed.IncludeTagsInEvents())
 	return err
 }
 
@@ -319,4 +358,9 @@ func DefaultProcessors() bool {
 
 func EncryptedConfig() bool {
 	return current.EncryptedConfig()
+}
+
+// IncludeTagsInEvents reports if the agent tags must be attached to collected events.
+func IncludeTagsInEvents() bool {
+	return current.IncludeTagsInEvents()
 }

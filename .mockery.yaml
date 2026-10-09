@@ -4,10 +4,12 @@ template: testify
 filename: mocks.go
 template-data:
   unroll-variadic: true
+  boilerplate-file: dev-tools/licenses/ELASTIC-LICENSE-2.0-header.txt
 packages:
-  github.com/elastic/elastic-agent/internal/pkg/agent/application:
+  github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/ttl:
     interfaces:
-      rollbacksSource: {}
+      Source: {}
+      ReadOnlySource: {}
   github.com/elastic/elastic-agent/internal/pkg/agent/application/actions/handlers:
     interfaces:
       Uploader: {}
@@ -17,14 +19,10 @@ packages:
   github.com/elastic/elastic-agent/internal/pkg/agent/application/info:
     interfaces:
       Agent: {}
-  github.com/elastic/elastic-agent/internal/pkg/agent/application/gateway/fleet:
-    interfaces:
-      rollbacksSource: {}
   github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade:
     interfaces:
       WatcherHelper: {}
       watcherGrappler: {}
-      availableRollbacksSource: {}
   github.com/elastic/elastic-agent/internal/pkg/agent/cmd:
     interfaces:
       agentWatcher: {}
@@ -41,3 +39,10 @@ packages:
   github.com/elastic/elastic-agent/pkg/control/v2/client:
     interfaces:
       Client: {}
+  github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator:
+    config:
+      pkgname: mocks
+      dir: "{{.InterfaceDir}}/mocks"
+      filename: runtime_manager.go
+    interfaces:
+      RuntimeManager: {}

@@ -20,8 +20,36 @@ if (-not $env:TEST_PACKAGE)
     $env:TEST_PACKAGE = "github.com/elastic/elastic-agent/testing/integration"
 }
 
+# Invoke-Retry runs the given command up to $Retries times total, with a growing
+# delay between attempts, to protect against transient failures.
+function Invoke-Retry
+{
+    param(
+        [scriptblock]$Command,
+        [int]$Retries = 3
+    )
+    for ($attempt = 1; $attempt -le $Retries; $attempt++)
+    {
+        & $Command
+        if ($LASTEXITCODE -eq 0)
+        {
+            return
+        }
+        if ($attempt -lt $Retries)
+        {
+            $wait = 5 * $attempt
+            Write-Output "Attempt $attempt/$Retries exited $LASTEXITCODE, retrying in $wait seconds..."
+            Start-Sleep -Seconds $wait
+        }
+        else
+        {
+            Write-Output "Attempt $attempt/$Retries exited $LASTEXITCODE, no more retries left."
+        }
+    }
+}
+
 # TODO: make is not available on Windows yet hence we cannot use make install-gotestsum
-go install gotest.tools/gotestsum
+Invoke-Retry { go install gotest.tools/gotestsum }
 gotestsum --version
 
 $env:TEST_BINARY_NAME = "elastic-agent"
@@ -75,7 +103,8 @@ try
     {
         $gotestFlags += "-test.short"
     }
-    $gotestArgs = @("-tags=integration", ${gotestFlags}, "$env:TEST_PACKAGE", "-v", "-args", "-integration.groups=$GROUP_NAME", "-integration.sudo=$TEST_SUDO")
+    $fipsFilter = if ($env:FIPS) { $env:FIPS } else { "false" }
+    $gotestArgs = @("-tags=integration", ${gotestFlags}, "$env:TEST_PACKAGE", "-v", "-args", "-integration.groups=$GROUP_NAME", "-integration.sudo=$TEST_SUDO", "-integration.fips=$fipsFilter")
     & gotestsum --no-color -f standard-quiet --junitfile-hide-skipped-tests --junitfile "${outputXML}" --jsonfile "${outputJSON}" -- @gotestArgs
     $TestsExitCode = $LASTEXITCODE
 
@@ -90,7 +119,7 @@ finally
     if (Test-Path $outputXML)
     {
         # Install junit2html if not installed
-        go install github.com/kitproj/junit2html@latest
+        Invoke-Retry { go install github.com/kitproj/junit2html@latest }
         Get-Content $outputXML | junit2html > "build/TEST-report.html"
     }
     else

@@ -22,10 +22,11 @@ metadata:
   name: agent-clusterwide-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
+
 ---
 # Source: elastic-agent/templates/agent/service-account.yaml
 apiVersion: v1
@@ -34,10 +35,11 @@ metadata:
   name: agent-pernode-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
+
 ---
 # Source: elastic-agent/templates/agent/k8s/secret.yaml
 apiVersion: v1
@@ -46,10 +48,10 @@ metadata:
   name: agent-clusterwide-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 stringData:
 
   agent.yml: |-
@@ -281,6 +283,7 @@ stringData:
       kubernetes_leaderelection:
         enabled: true
         leader_lease: example-clusterwide
+
 ---
 # Source: elastic-agent/templates/agent/k8s/secret.yaml
 apiVersion: v1
@@ -289,10 +292,10 @@ metadata:
   name: agent-pernode-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 stringData:
 
   agent.yml: |-
@@ -464,6 +467,7 @@ stringData:
       kubernetes_leaderelection:
         enabled: false
         leader_lease: example-pernode
+
 ---
 # Source: elastic-agent/charts/kube-state-metrics/templates/role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -619,6 +623,8 @@ rules:
   resources:
     - volumeattachments
   verbs: ["list", "watch"]
+
+
 ---
 # Source: elastic-agent/templates/agent/cluster-role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -626,10 +632,10 @@ kind: ClusterRole
 metadata:
   name: agent-clusterWide-example-default
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 rules:
   - apiGroups: [ "" ] # "" indicates the core API group
     resources:
@@ -699,6 +705,7 @@ rules:
       - get
       - list
       - watch
+
 ---
 # Source: elastic-agent/templates/agent/cluster-role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -706,10 +713,10 @@ kind: ClusterRole
 metadata:
   name: agent-perNode-example-default
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 rules:
   - apiGroups: [ "" ] # "" indicates the core API group
     resources:
@@ -779,6 +786,7 @@ rules:
       - get
       - list
       - watch
+
 ---
 # Source: elastic-agent/charts/kube-state-metrics/templates/clusterrolebinding.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -808,10 +816,10 @@ kind: ClusterRoleBinding
 metadata:
   name: agent-clusterWide-example-default
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 subjects:
   - kind: ServiceAccount
     name: agent-clusterwide-example
@@ -820,6 +828,7 @@ roleRef:
   kind: ClusterRole
   name: agent-clusterWide-example-default
   apiGroup: rbac.authorization.k8s.io
+
 ---
 # Source: elastic-agent/templates/agent/cluster-role-binding.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -827,10 +836,10 @@ kind: ClusterRoleBinding
 metadata:
   name: agent-perNode-example-default
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 subjects:
   - kind: ServiceAccount
     name: agent-pernode-example
@@ -839,6 +848,7 @@ roleRef:
   kind: ClusterRole
   name: agent-perNode-example-default
   apiGroup: rbac.authorization.k8s.io
+
 ---
 # Source: elastic-agent/charts/kube-state-metrics/templates/service.yaml
 apiVersion: v1
@@ -867,6 +877,7 @@ spec:
   selector:    
     app.kubernetes.io/name: kube-state-metrics
     app.kubernetes.io/instance: example
+
 ---
 # Source: elastic-agent/templates/agent/k8s/daemonset.yaml
 apiVersion: apps/v1
@@ -875,10 +886,10 @@ metadata:
   name: agent-pernode-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 spec:
   selector:
     matchLabels:
@@ -909,7 +920,7 @@ spec:
           value: /usr/share/elastic-agent/state
         - name: ELASTIC_NETINFO
           value: "false"
-        image: docker.elastic.co/elastic-agent/elastic-agent:9.5.0-SNAPSHOT
+        image: docker.elastic.co/elastic-agent/elastic-agent:9.6.0-SNAPSHOT
         imagePullPolicy: IfNotPresent
         name: agent
         resources:
@@ -963,6 +974,7 @@ spec:
         secret:
           defaultMode: 292
           secretName: agent-pernode-example
+
 ---
 # Source: elastic-agent/charts/kube-state-metrics/templates/deployment.yaml
 apiVersion: apps/v1
@@ -1049,6 +1061,7 @@ spec:
             drop:
             - ALL
           readOnlyRootFilesystem: true
+
 ---
 # Source: elastic-agent/templates/agent/k8s/deployment.yaml
 apiVersion: apps/v1
@@ -1057,10 +1070,10 @@ metadata:
   name: agent-clusterwide-example
   namespace: "default"
   labels:
-    helm.sh/chart: elastic-agent-9.5.0-SNAPSHOT
+    helm.sh/chart: elastic-agent-9.6.0-SNAPSHOT
     app.kubernetes.io/name: elastic-agent
     app.kubernetes.io/instance: example
-    app.kubernetes.io/version: 9.5.0
+    app.kubernetes.io/version: 9.6.0
 spec:
   selector:
     matchLabels:
@@ -1091,7 +1104,7 @@ spec:
           value: /usr/share/elastic-agent/state
         - name: ELASTIC_NETINFO
           value: "false"
-        image: docker.elastic.co/elastic-agent/elastic-agent:9.5.0-SNAPSHOT
+        image: docker.elastic.co/elastic-agent/elastic-agent:9.6.0-SNAPSHOT
         imagePullPolicy: IfNotPresent
         name: agent
         resources:
@@ -1130,3 +1143,4 @@ spec:
         secret:
           defaultMode: 292
           secretName: agent-clusterwide-example
+

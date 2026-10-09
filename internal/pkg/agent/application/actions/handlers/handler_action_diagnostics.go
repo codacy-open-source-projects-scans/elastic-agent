@@ -21,10 +21,10 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/diagnostics"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker"
 	"github.com/elastic/elastic-agent/internal/pkg/otel"
 	"github.com/elastic/elastic-agent/pkg/component"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 
 	"golang.org/x/time/rate"
 )
@@ -326,7 +326,7 @@ func (h *Diagnostics) diagComponents(ctx context.Context, action *fleetapi.Actio
 	}
 	rr, err := h.diagProvider.PerformComponentDiagnostics(ctx, additionalMetrics)
 	if err != nil {
-		h.log.Errorf("Error fetching component-level diagnostics: %w", err)
+		h.log.Errorf("Error fetching component-level diagnostics: %v", err)
 	}
 	h.log.Debug("Collecting results of component diagnostics")
 	for _, r := range rr {

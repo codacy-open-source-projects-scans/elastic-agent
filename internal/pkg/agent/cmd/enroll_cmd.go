@@ -26,12 +26,13 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/vault"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
 	"github.com/elastic/elastic-agent/internal/pkg/core/authority"
-	"github.com/elastic/elastic-agent/internal/pkg/core/backoff"
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
+	"github.com/elastic/elastic-agent/pkg/backoff"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client/wait"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/core/process"
+	pkgfleetapi "github.com/elastic/elastic-agent/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/utils"
 )
 
@@ -78,7 +79,7 @@ func newEnrollCmd(
 ) (*enrollCmd, error) {
 	if backoffFactory == nil {
 		backoffFactory = func(done <-chan struct{}) backoff.Backoff {
-			return backoff.NewEqualJitterBackoff(done, enroll.EnrollBackoffInit, enroll.EnrollBackoffMax)
+			return backoff.NewEqualJitterBackoff(done, pkgfleetapi.EnrollBackoffInit, pkgfleetapi.EnrollBackoffMax)
 		}
 	}
 	return &enrollCmd{
@@ -312,6 +313,27 @@ func (c *enrollCmd) fleetServerBootstrap(ctx context.Context, persistentConfig m
 	return token, nil
 }
 
+// fleetServerInternalHostPort returns the "host:port" the Fleet Server internal endpoint
+// listens on. It always binds to localhost; only the port is configurable, and changing it
+// is unsupported.
+func fleetServerInternalHostPort(internalPort uint16) string {
+	if internalPort == 0 {
+		internalPort = defaultFleetServerInternalPort
+	}
+	return net.JoinHostPort(defaultFleetServerInternalHost, strconv.Itoa(int(internalPort)))
+}
+
+// fleetServerInternalURL returns the URL of the Fleet Server internal endpoint, given the
+// "host:port" it listens on. Fleet Server only serves the endpoint over plain HTTP when it
+// runs insecure without a certificate of its own.
+func fleetServerInternalURL(internalHostPort string, insecure bool) string {
+	scheme := "https"
+	if insecure {
+		scheme = "http"
+	}
+	return scheme + "://" + internalHostPort
+}
+
 func (c *enrollCmd) prepareFleetTLS() error {
 	host := c.options.FleetServer.Host
 	if host == "" {
@@ -325,7 +347,7 @@ func (c *enrollCmd) prepareFleetTLS() error {
 		if c.options.FleetServer.InternalPort != defaultFleetServerInternalPort {
 			c.log.Warnf("Internal endpoint configured to: %d. Changing this value is not supported.", c.options.FleetServer.InternalPort)
 		}
-		c.options.InternalURL = net.JoinHostPort(defaultFleetServerInternalHost, strconv.Itoa(int(c.options.FleetServer.InternalPort)))
+		c.options.InternalURL = fleetServerInternalHostPort(c.options.FleetServer.InternalPort)
 	}
 
 	if c.options.FleetServer.Cert != "" && c.options.FleetServer.CertKey == "" {
@@ -342,7 +364,7 @@ func (c *enrollCmd) prepareFleetTLS() error {
 			}
 			c.options.URL = "http://" + net.JoinHostPort(host, strconv.Itoa(int(port)))
 			if c.options.FleetServer.ConnStr != "" && c.options.InternalURL != "" {
-				c.options.URL = "http://" + c.options.InternalURL
+				c.options.URL = fleetServerInternalURL(c.options.InternalURL, true)
 			}
 			c.options.Insecure = true
 			return nil
@@ -373,7 +395,7 @@ func (c *enrollCmd) prepareFleetTLS() error {
 
 	// Use internalURL if available
 	if c.options.FleetServer.ConnStr != "" && c.options.InternalURL != "" {
-		c.options.URL = "https://" + c.options.InternalURL
+		c.options.URL = fleetServerInternalURL(c.options.InternalURL, false)
 	}
 
 	return nil

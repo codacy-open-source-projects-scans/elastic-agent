@@ -13,8 +13,8 @@ import (
 	"github.com/elastic/elastic-agent-libs/transport/httpcommon"
 	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/utils"
 )
 
@@ -40,10 +40,12 @@ type EnrollOptions struct {
 	UserProvidedMetadata map[string]interface{}     `yaml:"-" json:"-"`
 	FixPermissions       *utils.FileOwner           `yaml:"-" json:"-"`
 	DelayEnroll          bool                       `yaml:"-" json:"-"`
+	RetryOnInvalidToken  bool                       `yaml:"-" json:"-"`
 	FleetServer          EnrollCmdFleetServerOption `yaml:"-" json:"-"`
 	SkipCreateSecret     bool                       `yaml:"-" json:"-"`
 	SkipDaemonRestart    bool                       `yaml:"-" json:"-"`
 	Tags                 []string                   `yaml:"tags,omitempty" json:"tags,omitempty"`
+	CheckinOnStateChange bool                       `yaml:"-" json:"-"`
 }
 
 // EnrollCmdFleetServerOption define all the supported enrollment options for bootstrapping with Fleet Server.

@@ -6,136 +6,327 @@ package elasticmonitoring
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/otel/sdk/resource"
 
-	"github.com/elastic/elastic-agent-libs/mapstr"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-func esExporterScope(exporterID string) instrumentation.Scope {
-	return instrumentation.Scope{
-		Name: "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter",
-		Attributes: attribute.NewSet(
-			attribute.String(otelComponentKindKey, "exporter"),
-			attribute.String(otelComponentIDKey, exporterID),
-		),
+func makeResourceMetrics(scopes []metricdata.ScopeMetrics) *metricdata.ResourceMetrics {
+	return &metricdata.ResourceMetrics{
+		Resource:     resource.NewSchemaless(),
+		ScopeMetrics: scopes,
 	}
 }
 
-func gaugeMetric[N int64 | float64](name string, value N) metricdata.Metrics {
-	return metricdata.Metrics{
-		Name: name,
-		Data: metricdata.Gauge[N]{
-			DataPoints: []metricdata.DataPoint[N]{
-				{Value: value},
+func TestMetricdataToPdata_ResourceAttributes(t *testing.T) {
+	res, err := resource.New(t.Context(),
+		resource.WithAttributes(
+			attribute.String("service.name", "elastic-agent"),
+			attribute.Int64("some.int", 7),
+			attribute.Float64("some.float", 1.5),
+			attribute.Bool("some.bool", true),
+		),
+	)
+	require.NoError(t, err)
+
+	rm := &metricdata.ResourceMetrics{Resource: res, ScopeMetrics: nil}
+	md := metricdataToPdata(rm)
+
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+	attrs := md.ResourceMetrics().At(0).Resource().Attributes()
+
+	v, ok := attrs.Get("service.name")
+	require.True(t, ok)
+	assert.Equal(t, "elastic-agent", v.Str())
+
+	v, ok = attrs.Get("some.int")
+	require.True(t, ok)
+	assert.Equal(t, int64(7), v.Int())
+
+	v, ok = attrs.Get("some.float")
+	require.True(t, ok)
+	assert.InDelta(t, 1.5, v.Double(), 1e-9)
+
+	v, ok = attrs.Get("some.bool")
+	require.True(t, ok)
+	assert.True(t, v.Bool())
+}
+
+func scopeWithAttrs(name string, attrs ...attribute.KeyValue) instrumentation.Scope {
+	return instrumentation.Scope{
+		Name:       name,
+		Attributes: attribute.NewSet(attrs...),
+	}
+}
+
+func TestMetricdataToPdata_ScopeNameAndAttributes(t *testing.T) {
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("my/scope",
+				attribute.String("otelcol.component.id", "elasticsearch/foo"),
+				attribute.String("otelcol.component.kind", "exporter"),
+			),
+			Metrics: []metricdata.Metrics{},
+		},
+	})
+
+	md := metricdataToPdata(rm)
+
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+	sms := md.ResourceMetrics().At(0).ScopeMetrics()
+	require.Equal(t, 1, sms.Len())
+
+	sm := sms.At(0)
+	assert.Equal(t, "my/scope", sm.Scope().Name())
+
+	id, ok := sm.Scope().Attributes().Get("otelcol.component.id")
+	require.True(t, ok)
+	assert.Equal(t, "elasticsearch/foo", id.Str())
+
+	kind, ok := sm.Scope().Attributes().Get("otelcol.component.kind")
+	require.True(t, ok)
+	assert.Equal(t, "exporter", kind.Str())
+}
+
+func TestMetricdataToPdata_Int64Gauge(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("test"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "otelcol_exporter_queue_size",
+					Data: metricdata.Gauge[int64]{
+						DataPoints: []metricdata.DataPoint[int64]{
+							{
+								Value:     42,
+								StartTime: ts.Add(-time.Second),
+								Time:      ts,
+								Attributes: attribute.NewSet(
+									attribute.String("exporter", "elasticsearch"),
+								),
+							},
+						},
+					},
+				},
 			},
 		},
-	}
+	})
+
+	md := metricdataToPdata(rm)
+
+	sm := md.ResourceMetrics().At(0).ScopeMetrics().At(0)
+	require.Equal(t, 1, sm.Metrics().Len())
+	m := sm.Metrics().At(0)
+	assert.Equal(t, "otelcol_exporter_queue_size", m.Name())
+	assert.Equal(t, pmetric.MetricTypeGauge, m.Type())
+
+	dps := m.Gauge().DataPoints()
+	require.Equal(t, 1, dps.Len())
+	dp := dps.At(0)
+	assert.Equal(t, pmetric.NumberDataPointValueTypeInt, dp.ValueType())
+	assert.Equal(t, int64(42), dp.IntValue())
+
+	v, ok := dp.Attributes().Get("exporter")
+	require.True(t, ok)
+	assert.Equal(t, "elasticsearch", v.Str())
 }
 
-func sumMetric[N int64 | float64](name string, values ...N) metricdata.Metrics {
-	var dataPoints []metricdata.DataPoint[N]
-	for _, v := range values {
-		dataPoints = append(dataPoints, metricdata.DataPoint[N]{Value: v})
-	}
-	return metricdata.Metrics{
-		Name: name,
-		Data: metricdata.Sum[N]{DataPoints: dataPoints},
-	}
-}
-
-func TestConvertAllMetrics(t *testing.T) {
-	const exporterID = "elasticsearch/_agent-component/monitoring"
-	// Test values here are mostly arbitrary except that no two are the same.
-	const (
-		queueCapacity = int64(1000)
-		queueSize     = int64(500)
-		sentLogs      = int64(1)
-		sentSpans     = int64(2)
-		sentMetrics   = int64(3)
-		failedLogs    = int64(4)
-		failedSpans   = int64(5)
-		failedMetrics = int64(6)
-		docsProcessed = int64(100)
-		docsRetried   = int64(8)
-		bulkRequests  = int64(9)
-		flushedBytes  = int64(10)
-	)
-	scopeMetrics := metricdata.ScopeMetrics{
-		Scope: esExporterScope(exporterID),
-		Metrics: []metricdata.Metrics{
-			gaugeMetric(otelQueueCapacityKey, queueCapacity),
-			gaugeMetric(otelQueueSizeKey, queueSize),
-			sumMetric(otelSentLogsKey, sentLogs),
-			sumMetric(otelSentSpansKey, sentSpans),
-			sumMetric(otelSentMetricsKey, sentMetrics),
-			sumMetric(otelFailedLogsKey, failedLogs),
-			sumMetric(otelFailedSpansKey, failedSpans),
-			sumMetric(otelFailedMetricsKey, failedMetrics),
-			sumMetric(otelDocsProcessedKey, docsProcessed),
-			sumMetric(otelDocsRetriedKey, docsRetried),
-			sumMetric(otelFlushedBytesKey, flushedBytes),
-			sumMetric(otelBulkRequestsKey, bulkRequests),
+func TestMetricdataToPdata_Float64Gauge(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("test"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "some.float.metric",
+					Data: metricdata.Gauge[float64]{
+						DataPoints: []metricdata.DataPoint[float64]{
+							{Value: 3.14, Time: ts},
+						},
+					},
+				},
+			},
 		},
-	}
-	result := convertScopeMetrics([]metricdata.ScopeMetrics{scopeMetrics})
-	assert.Equal(t, 1, len(result), "The scope metrics contain one exporter")
+	})
 
-	metrics, ok := result[exporterID]
-	require.Truef(t, ok, "Exporter metrics should contain metrics for the id '%v'", exporterID)
+	md := metricdataToPdata(rm)
 
-	beatEvent := mapstr.M{}
-	addMetricsToEventFields(zap.NewNop(), metrics, &beatEvent)
+	m := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+	assert.Equal(t, pmetric.MetricTypeGauge, m.Type())
+	dp := m.Gauge().DataPoints().At(0)
+	assert.Equal(t, pmetric.NumberDataPointValueTypeDouble, dp.ValueType())
+	assert.InDelta(t, 3.14, dp.DoubleValue(), 1e-9)
+}
 
-	maxEvents, err := beatEvent.GetValue(beatsQueueMaxEventsKey)
-	assert.NoError(t, err)
-	assert.Equal(t, queueCapacity, maxEvents)
+func TestMetricdataToPdata_Int64Sum(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("test"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "otelcol_exporter_sent_log_records",
+					Data: metricdata.Sum[int64]{
+						IsMonotonic: true,
+						Temporality: metricdata.CumulativeTemporality,
+						DataPoints: []metricdata.DataPoint[int64]{
+							{Value: 100, Time: ts},
+						},
+					},
+				},
+			},
+		},
+	})
 
-	filledEvents, err := beatEvent.GetValue(beatsQueueFilledEventsKey)
-	assert.NoError(t, err)
-	assert.Equal(t, queueSize, filledEvents)
+	md := metricdataToPdata(rm)
 
-	filledPct, err := beatEvent.GetValue(beatsQueueFilledPctKey)
-	assert.NoError(t, err)
-	assert.Equal(t, float64(queueSize)/float64(queueCapacity), filledPct)
+	m := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+	assert.Equal(t, pmetric.MetricTypeSum, m.Type())
+	assert.True(t, m.Sum().IsMonotonic())
+	assert.Equal(t, pmetric.AggregationTemporalityCumulative, m.Sum().AggregationTemporality())
+	assert.Equal(t, int64(100), m.Sum().DataPoints().At(0).IntValue())
+}
 
-	expectedSent := sentLogs + sentSpans + sentMetrics
-	eventsAcked, err := beatEvent.GetValue(beatsOutputEventsAckedKey)
-	assert.NoError(t, err)
-	assert.Equal(t, expectedSent, eventsAcked)
+func TestMetricdataToPdata_Float64Sum(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("test"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "some.float.sum",
+					Data: metricdata.Sum[float64]{
+						IsMonotonic: false,
+						Temporality: metricdata.DeltaTemporality,
+						DataPoints: []metricdata.DataPoint[float64]{
+							{Value: 2.718, Time: ts},
+						},
+					},
+				},
+			},
+		},
+	})
 
-	// Subtlety: what beats calls "dropped", OTel calls "failed."
-	expectedFailed := failedLogs + failedSpans + failedMetrics
-	eventsDropped, err := beatEvent.GetValue(beatsOutputEventsDroppedKey)
-	assert.NoError(t, err)
-	assert.Equal(t, expectedFailed, eventsDropped)
+	md := metricdataToPdata(rm)
 
-	eventsTotal, err := beatEvent.GetValue(beatsOutputEventsTotalKey)
-	assert.NoError(t, err)
-	assert.Equal(t, eventsTotal, docsProcessed)
+	m := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+	assert.Equal(t, pmetric.MetricTypeSum, m.Type())
+	assert.False(t, m.Sum().IsMonotonic())
+	assert.Equal(t, pmetric.AggregationTemporalityDelta, m.Sum().AggregationTemporality())
+	assert.InDelta(t, 2.718, m.Sum().DataPoints().At(0).DoubleValue(), 1e-9)
+}
 
-	// Subtlety: what beats calls "failed", OTel calls "retried."
-	eventsFailed, err := beatEvent.GetValue(beatsOutputEventsFailedKey)
-	assert.NoError(t, err)
-	assert.Equal(t, docsRetried, eventsFailed)
+func TestMetricdataToPdata_DataPointAttributes(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("test"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "some.metric",
+					Data: metricdata.Gauge[int64]{
+						DataPoints: []metricdata.DataPoint[int64]{
+							{
+								Value: 7,
+								Time:  ts,
+								Attributes: attribute.NewSet(
+									attribute.String("input_id", "my-input"),
+									attribute.String("input_type", "log"),
+									attribute.Int64("count", 99),
+									attribute.Bool("active", true),
+								),
+							},
+						},
+					},
+				},
+			},
+		},
+	})
 
-	writeBytes, err := beatEvent.GetValue(beatsOutputWriteBytesKey)
-	assert.NoError(t, err)
-	assert.Equal(t, flushedBytes, writeBytes)
+	md := metricdataToPdata(rm)
 
-	expectedActive := docsProcessed - expectedSent - expectedFailed
-	active, err := beatEvent.GetValue(beatsOutputEventsActiveKey)
-	assert.NoError(t, err)
-	assert.Equal(t, expectedActive, active)
+	dp := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
 
-	// The ES exporter doesn't have a concept of batches that is semantically
-	// identical to Beats, but bulk requests are a close analogue.
-	batches, err := beatEvent.GetValue(beatsOutputEventsBatchesKey)
-	assert.NoError(t, err)
-	assert.Equal(t, bulkRequests, batches)
+	v, ok := dp.Attributes().Get("input_id")
+	require.True(t, ok)
+	assert.Equal(t, "my-input", v.Str())
+
+	v, ok = dp.Attributes().Get("input_type")
+	require.True(t, ok)
+	assert.Equal(t, "log", v.Str())
+
+	v, ok = dp.Attributes().Get("count")
+	require.True(t, ok)
+	assert.Equal(t, int64(99), v.Int())
+
+	v, ok = dp.Attributes().Get("active")
+	require.True(t, ok)
+	assert.True(t, v.Bool())
+}
+
+func TestMetricdataToPdata_MultipleScopes(t *testing.T) {
+	ts := time.Now()
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope:   scopeWithAttrs("scope-a"),
+			Metrics: []metricdata.Metrics{{Name: "metric.a", Data: metricdata.Gauge[int64]{DataPoints: []metricdata.DataPoint[int64]{{Value: 1, Time: ts}}}}},
+		},
+		{
+			Scope:   scopeWithAttrs("scope-b"),
+			Metrics: []metricdata.Metrics{{Name: "metric.b", Data: metricdata.Gauge[int64]{DataPoints: []metricdata.DataPoint[int64]{{Value: 2, Time: ts}}}}},
+		},
+	})
+
+	md := metricdataToPdata(rm)
+
+	sms := md.ResourceMetrics().At(0).ScopeMetrics()
+	require.Equal(t, 2, sms.Len())
+	assert.Equal(t, "scope-a", sms.At(0).Scope().Name())
+	assert.Equal(t, "scope-b", sms.At(1).Scope().Name())
+	assert.Equal(t, "metric.a", sms.At(0).Metrics().At(0).Name())
+	assert.Equal(t, "metric.b", sms.At(1).Metrics().At(0).Name())
+}
+
+func TestMetricdataToPdata_RegistryBridgeReceiverAttr(t *testing.T) {
+	// Verify that the "receiver" data point attribute is preserved, since the
+	// connector's collectReceiverMetrics depends on it.
+	ts := time.Now()
+	otelID := "filebeatreceiver/_agent-component/filebeat-0"
+	rm := makeResourceMetrics([]metricdata.ScopeMetrics{
+		{
+			Scope: scopeWithAttrs("github.com/elastic/beats/v7/x-pack/otel/telemetry"),
+			Metrics: []metricdata.Metrics{
+				{
+					Name: "harvester.running",
+					Data: metricdata.Gauge[int64]{
+						DataPoints: []metricdata.DataPoint[int64]{
+							{
+								Value: 5,
+								Time:  ts,
+								Attributes: attribute.NewSet(
+									attribute.String("receiver", otelID),
+								),
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	md := metricdataToPdata(rm)
+
+	dp := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
+	v, ok := dp.Attributes().Get("receiver")
+	require.True(t, ok)
+	assert.Equal(t, otelID, v.Str())
 }

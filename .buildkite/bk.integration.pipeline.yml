@@ -2,18 +2,28 @@
 
 env:
   ASDF_MAGE_VERSION: 1.14.0
+  ASDF_KIND_VERSION: "0.32.0"
+  ASDF_TERRAFORM_VERSION: 1.9.2
 
   # The following images are defined here and their values will be updated by updatecli
   # Please do not change them manually.
-  IMAGE_UBUNTU_2404_X86_64: "platform-ingest-elastic-agent-ubuntu-2404-1776780011"
-  IMAGE_UBUNTU_2404_ARM_64: "platform-ingest-elastic-agent-ubuntu-2404-aarch64-1776780011"
-  IMAGE_RHEL_8: "platform-ingest-elastic-agent-rhel-8-1776780011"
-  IMAGE_RHEL_10: "platform-ingest-elastic-agent-rhel-10-1776780011"
-  IMAGE_DEBIAN_11: "platform-ingest-elastic-agent-debian-11-1776780011"
-  IMAGE_DEBIAN_13: "platform-ingest-elastic-agent-debian-13-1776780011"
-  IMAGE_WIN_2022: "platform-ingest-elastic-agent-windows-2022-1776780011"
-  IMAGE_WIN_2025: "platform-ingest-elastic-agent-windows-2025-1776780011"
-  ASDF_TERRAFORM_VERSION: 1.9.2
+  IMAGE_UBUNTU_2204_X86_64: "platform-ingest-elastic-agent-ubuntu-2204-1789434098"
+  IMAGE_UBUNTU_2404_X86_64: "platform-ingest-elastic-agent-ubuntu-2404-1789434098"
+  IMAGE_UBUNTU_2404_ARM_64: "platform-ingest-elastic-agent-ubuntu-2404-aarch64-1789434098"
+  IMAGE_UBUNTU_2604_X86_64: "platform-ingest-elastic-agent-ubuntu-2604-1789434098"
+  IMAGE_UBUNTU_2604_ARM_64: "platform-ingest-elastic-agent-ubuntu-2604-aarch64-1789434098"
+  IMAGE_RHEL_8: "platform-ingest-elastic-agent-rhel-8-1789434098"
+  IMAGE_RHEL_10: "platform-ingest-elastic-agent-rhel-10-1789434098"
+  IMAGE_DEBIAN_11: "platform-ingest-elastic-agent-debian-11-1789434098"
+  IMAGE_DEBIAN_13: "platform-ingest-elastic-agent-debian-13-1789434098"
+  IMAGE_WIN_2022: "platform-ingest-elastic-agent-windows-2022-1789434098"
+  IMAGE_WIN_2025: "platform-ingest-elastic-agent-windows-2025-1789434098"
+  IMAGE_WIN_2016: "platform-ingest-elastic-agent-windows-2016-1789434098"
+  IMAGE_WIN_10: "platform-ingest-elastic-agent-windows-10-pro"
+  IMAGE_WIN_11: "platform-ingest-elastic-agent-windows-11-pro"
+  IMAGE_WIN_11_ARM64: "platform-ingest-elastic-agent-windows-11-pro-arm64"
+  # Same version for all the azure images
+  IMAGE_WIN_VERSION: "1.0.1789434098"
 
 # This section is used to define the plugins that will be used in the pipeline.
 # See https://buildkite.com/docs/pipelines/integrations/plugins/using#using-yaml-anchors-with-plugins
@@ -21,7 +31,7 @@ common:
   - google_oidc_plugin: &google_oidc_plugin
       # See https://github.com/elastic/oblt-infra/blob/main/conf/resources/repos/elastic-agent/01-gcp-oidc.tf
       # This plugin authenticates to Google Cloud using the OIDC token.
-      elastic/oblt-google-auth#v1.3.0:
+      elastic/oblt-google-auth#v1.3.1:
         lifetime: 10800 # seconds
         project-id: "elastic-observability-ci"
         project-number: "911195782929"
@@ -39,11 +49,83 @@ common:
           KIBANA_HOST: ea-serverless-it-kibana-hostname
           KIBANA_USERNAME: ea-serverless-it-kibana-username
           KIBANA_PASSWORD: ea-serverless-it-kibana-password
-  - vault_ec_key_prod: &vault_ec_key_prod
-      elastic/vault-secrets#v0.1.0:
-        path: "kv/ci-shared/platform-ingest/platform-ingest-ec-prod"
-        field: "apiKey"
-        env_var: "EC_API_KEY"
+  - google_oidc_observability_plugin: &google_oidc_observability_plugin
+      # See https://github.com/elastic/oblt-infra/blob/main/conf/resources/repos/elastic-agent/01-gcp-oidc.tf
+      # This plugin authenticates to Google Cloud using the OIDC token.
+      elastic/oblt-google-auth#v1.3.1:
+        lifetime: 10800 # seconds
+  - oblt_cli_plugin: &oblt_cli_plugin
+      elastic/oblt-cli#v0.4.2:
+        version-file: .oblt-cli-version
+  - vault_github_token: &vault_github_token
+      elastic/vault-github-token#v0.2.1:
+  # Variants/Groups for the Windows ITs
+  - windows_variants: &windows_variants
+      - "default"
+      - "fleet"
+      - "fleet-endpoint-security"
+      - "fleet-endpoint-security-mtls"
+      - "fleet-privileged"
+      - "fleet-proxy"
+      - "fleet-upgrade"
+      - "install-uninstall"
+      - "standalone-upgrade"
+      - "standalone-upgrade-unprivileged"
+      - "upgrade"
+      - "upgrade-flavor"
+      - "upgrade-rollback"
+  # Variants/Groups for the Linux AMD64 ITs (tar.gz package)
+  - linux_variants: &linux_variants
+    - container
+    - default
+    - fleet
+    - fleet-airgapped
+    - fleet-airgapped-privileged
+    - fleet-endpoint-security
+    - fleet-endpoint-security-mtls
+    - fleet-privileged
+    - fleet-proxy
+    - fleet-upgrade
+    - fleet-upgrade-to-pr-build
+    - hostname
+    - install-uninstall
+    - standalone-upgrade
+    - standalone-upgrade-unprivileged
+    - upgrade
+    - upgrade-flavor
+    - upgrade-rollback
+
+  # Variants/Groups for the Linux AMD64 ITs (deb package)
+  - linux_deb_variants: &linux_deb_variants
+    - deb
+
+  # Variants/Groups for the Linux AMD64 ITs (rpm package)
+  - linux_rpm_variants: &linux_rpm_variants
+    - rpm
+
+  # Variants/Groups for the Linux ARM ITs
+  - linux_arm_variants: &linux_arm_variants
+    - default
+    - fleet
+    - fleet-proxy
+    - fleet-upgrade
+    - standalone-upgrade
+    - standalone-upgrade-unprivileged
+    - upgrade
+    - upgrade-flavor
+    - upgrade-rollback
+    # ARM tests are enabled for only selected groups in order to save resources
+    # - fleet-endpoint-security
+    # - fleet-endpoint-security-mtls
+    # - fleet-airgapped
+    # - fleet-airgapped-privileged
+    # - fleet-privileged
+    # - fleet-upgrade-to-pr-build
+    # - install-uninstall
+    # - hostname
+    # - deb
+    # - container
+
   # key to hold the list of k8s version to test against
   - k8s_test:
     versions: &k8s_test_versions
@@ -54,12 +136,44 @@ common:
       - v1.31.0
       - v1.32.0
       - v1.33.0
-      - &k8s_max_test_version v1.34.0
+      - v1.34.0
+      - v1.35.0
+      - &k8s_max_test_version v1.36.1 # kind doesn't have a v1.36.0 image
+    versions_without_min_max: &k8s_test_versions_without_min_max
+      - v1.28.15
+      - v1.29.14
+      - v1.30.0
+      - v1.31.0
+      - v1.32.0
+      - v1.33.0
+      - v1.34.0
+      - v1.35.0
+    all_variants: &k8s_test_all_variants
+      - basic
+      - complete
+      - complete-wolfi
+      - elastic-otel-collector
+      - elastic-otel-collector-wolfi
+      - service
+      - slim
+      - slim-wolfi
+      - wolfi
+    default_variants: &k8s_test_default_variants
+      - complete
+      - complete-wolfi
+      - elastic-otel-collector
+    all_variants_without_default: &k8s_test_all_variants_without_default
+      - basic
+      - elastic-otel-collector-wolfi
+      - service
+      - slim
+      - slim-wolfi
+      - wolfi
     env: &k8s_test_env
       K8S_VERSION: "{{matrix.version}}"
-      ASDF_KIND_VERSION: "0.27.0"
       DOCKER_VARIANTS: "{{matrix.variants}}"
       TARGET_ARCH: "amd64"
+      K8S_PROVISIONER: "kind"
     agent: &k8s_test_agent
       provider: "gcp"
       machineType: "n2-standard-8"
@@ -67,12 +181,18 @@ common:
       diskSizeGb: 80
     command: &k8s_test_command |
       buildkite-agent artifact download build/distributions/*-linux-amd64.docker.tar.gz . --step 'packaging-containers-amd64'
-      .buildkite/scripts/steps/integration_tests_tf.sh kubernetes false
+      .buildkite/scripts/steps/integration_tests_oblt-cli.sh kubernetes false
+    command_retry: &k8s_test_command_with_sleep |
+      MIN=0
+      MAX=9
+      # echo let's avoid running multiple requests at the same time to avoid overwhelming the cluster and causing deployment issues
+      sleep $(( MIN + RANDOM % (MAX - MIN + 1) ))
+      buildkite-agent artifact download build/distributions/*-linux-amd64.docker.tar.gz . --step 'packaging-containers-amd64'
+      .buildkite/scripts/steps/integration_tests_oblt-cli.sh kubernetes false
     artifact_paths: &k8s_test_artifact_paths
       - build/*
       - build/diagnostics/**
-      - build/*.pod_logs_dump/*
-
+      - build/k8s-logs-*/**
 
 steps:
   - label: "Custom ECH Testing"
@@ -80,14 +200,15 @@ steps:
     depends_on:
       - packaging-containers-amd64
       - packaging-containers-arm64
+      - packaging-linux-amd64
     env:
       TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-      TF_VAR_integration_server_docker_image: "docker.elastic.co/beats-ci/elastic-agent-cloud:git-${BUILDKITE_COMMIT:0:12}"
       FORCE_ESS_CREATE: "true"
+      INTEGRATION_SERVER_DOCKER_IMAGE: "docker.elastic.co/beats-ci/elastic-agent-cloud:git-${BUILDKITE_COMMIT:0:12}"
     command: |
       #!/usr/bin/env bash
-      buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-amd64'
-      .buildkite/scripts/steps/integration_tests_tf.sh ech true
+      buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-linux-amd64'
+      .buildkite/scripts/steps/integration_tests_oblt-cli.sh ech true
     artifact_paths:
       - build/*
       - build/diagnostics/**
@@ -99,25 +220,26 @@ steps:
       machineType: "n2-standard-8"
       image: "${IMAGE_UBUNTU_2404_X86_64}"
     plugins:
-      - *vault_ec_key_prod
+      - *google_oidc_observability_plugin
+      - *oblt_cli_plugin
+      - *vault_github_token
 
   - label: Start ESS stack for integration tests
     key: integration-ess
     notify:
       - github_commit_status:
           context: "buildkite/elastic-agent-extended-testing - ESS stack provision"
-    command: .buildkite/scripts/steps/ess_start.sh
+    command: .buildkite/scripts/steps/ess_start_oblt-cli.sh
     retry:
       automatic:
         limit: 1
-    artifact_paths:
-      - test_infra/ess/*.tfstate
-      - test_infra/ess/*.lock.hcl
     agents:
       image: "docker.elastic.co/ci-agent-images/platform-ingest/buildkite-agent-beats-ci-with-hooks:0.5"
       useCustomGlobalHooks: true
     plugins:
-      - *vault_ec_key_prod
+      - *google_oidc_observability_plugin
+      - *oblt_cli_plugin
+      - *vault_github_token
 
   - group: "Extended runtime leak tests"
     key: extended-integration-tests
@@ -129,11 +251,11 @@ steps:
     steps:
       - label: "Windows:2022:amd64:sudo"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/leak"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64*  . --step 'packaging-amd64'
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64*  . --step 'packaging-windows-amd64'
           .buildkite/scripts/steps/integration_tests_tf.ps1 fleet true
         artifact_paths:
           - build/*
@@ -146,15 +268,17 @@ steps:
           automatic:
             limit: 1
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
 
       - label: "Windows:2025:amd64:sudo"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/leak"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
           .buildkite/scripts/steps/integration_tests_tf.ps1 fleet true
         artifact_paths:
           - build/*
@@ -167,15 +291,18 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_WIN_2025}"
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
 
       - label: "Ubuntu:2404:amd64:sudo"
-        depends_on: packaging-amd64
+        depends_on:
+          - packaging-linux-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/leak"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.sh fleet true
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-linux-amd64'
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh fleet true
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -187,24 +314,27 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_UBUNTU_2404_X86_64}"
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
 
-  - group: "Stateful: Windows"
-    key: integration-tests-win
+  - group: "Stateful: Windows (tier 1)"
+    if: build.pull_request.id != null
+    key: integration-tests-win-tier-1
     notify:
       - github_commit_status:
-          context: "buildkite/elastic-agent-extended-testing - Windows"
+          context: "buildkite/elastic-agent-extended-testing - Windows - tier 1"
     depends_on:
       - integration-ess
     steps:
-      - label: "Win2022:sudo:{{matrix}}"
+      - label: "windows:amd64:tier1:sudo:{{matrix.variant}}"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix}} true
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} true
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -216,25 +346,21 @@ steps:
           automatic:
             limit: 1
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
-          - default
-          - fleet
-          - fleet-endpoint-security
-          - fleet-privileged
-          - standalone-upgrade
-          - upgrade
-          - upgrade-flavor
-          - install-uninstall
+          setup:
+            variant: *windows_variants
 
-      - label: "Win2022:non-sudo:{{matrix}}"
+      - label: "windows:amd64:tier1:non-sudo:{{matrix.variant}}"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix}} false
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} false
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -246,78 +372,272 @@ steps:
           automatic:
             limit: 1
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
-          - default
+          setup:
+            variant:
+              - default
 
-      - label: "Win2025:sudo:{{matrix}}"
-        depends_on:
-          - packaging-amd64
-        env:
-          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-        command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix}} true
-        artifact_paths:
-          - build/*
-          - build/diagnostics/**
-        agents:
-          provider: "gcp"
-          machineType: "n2-standard-8"
-          image: "${IMAGE_WIN_2025}"
-        retry:
-          automatic:
-            limit: 1
-        plugins:
-          - *vault_ec_key_prod
-        matrix:
-          - default
-          - fleet
-          - fleet-endpoint-security
-          - fleet-privileged
-          - standalone-upgrade
-          - upgrade
-          - upgrade-flavor
-          - install-uninstall
-
-      - label: "Win2025:non-sudo:{{matrix}}"
-        depends_on:
-          - packaging-amd64
-        env:
-          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-        command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix}} false
-        artifact_paths:
-          - build/*
-          - build/diagnostics/**
-        retry:
-          automatic:
-            limit: 1
-        agents:
-          provider: "gcp"
-          machineType: "n2-standard-8"
-          image: "${IMAGE_WIN_2025}"
-        plugins:
-          - *vault_ec_key_prod
-        matrix:
-          - default
-
-  - group: "Stateful:Ubuntu"
-    key: integration-tests-ubuntu
+  - group: "Stateful: Windows (tier 2)"
+    if_changed:
+      include:
+        - .buildkite/**
+        - magefile.go
+        - dev-tools/**
+        - go.mod
+        - go.sum
+    key: integration-tests-win-tier-2
     notify:
       - github_commit_status:
-          context: "buildkite/elastic-agent-extended-testing - Ubuntu"
+          context: "buildkite/elastic-agent-extended-testing - Windows - tier 2"
     depends_on:
       - integration-ess
     steps:
-      - label: "x86_64:non-sudo: {{matrix}}"
-        depends_on: packaging-amd64
+      - label: "windows:amd64:tier2:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-windows-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+          # Disable redaction for Windows 2016 when using OIDC plugin due to some unsupported Windows build system
+          # https://buildkite.com/resources/changelog/329-agent-v3-dot-104-oidc-token-requests-now-require-job-api-socket-for-redaction/#main-content
+          BUILDKITE_AGENT_OIDC_REQUEST_TOKEN_SKIP_TOKEN_REDACTION: "true"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_WIN_2016}"
+            variant: *windows_variants
+
+      - label: "windows:amd64:tier2:non-sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-windows-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+          # Disable redaction for Windows 2016 when using OIDC plugin due to some unsupported Windows build system
+          # https://buildkite.com/resources/changelog/329-agent-v3-dot-104-oidc-token-requests-now-require-job-api-socket-for-redaction/#main-content
+          BUILDKITE_AGENT_OIDC_REQUEST_TOKEN_SKIP_TOKEN_REDACTION: "true"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} false
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_WIN_2016}"
+            variant:
+              - default
+
+  - group: "Stateful: Windows (tier 3)"
+    key: integration-tests-win-tier-3
+    # NOTE: as long as we use the scheduler pipeline we need to use BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG.
+    #       We use that pipeline to run the tier 3 tests on a schedule for the active branches.
+    if: build.source == "schedule" || build.env("BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG") == "elastic-agent-pipeline-scheduler"
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Windows - tier 3"
+    depends_on:
+      - integration-ess
+    steps:
+      - label: "windows:amd64:tier3:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-windows-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+          # Disable redaction for Windows 2016 when using OIDC plugin due to some unsupported Windows build system
+          # https://buildkite.com/resources/changelog/329-agent-v3-dot-104-oidc-token-requests-now-require-job-api-socket-for-redaction/#main-content
+          BUILDKITE_AGENT_OIDC_REQUEST_TOKEN_SKIP_TOKEN_REDACTION: "true"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_WIN_2022}"
+              - "${IMAGE_WIN_2025}"
+            variant: *windows_variants
+
+      - label: "windows:amd64:tier3:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix}} false
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "azure"
+          image: "{{matrix.os}}"
+          imageVersion: "${IMAGE_WIN_VERSION}"
+          vmSize: "Standard_D8s_v5"
+          diskSizeGb: "256"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_WIN_10}"
+              - "${IMAGE_WIN_11}"
+            variant: *windows_variants
+
+      - label: "windows:amd64:tier3:non-sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-windows-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} false
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "azure"
+          image: "{{matrix.os}}"
+          imageVersion: "${IMAGE_WIN_VERSION}"
+          vmSize: "Standard_D8s_v5"
+          diskSizeGb: "256"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_WIN_10}"
+              - "${IMAGE_WIN_11}"
+            variant:
+              - default
+
+      - label: "windows:arm64:tier3:sudo:{{matrix.variant}}"
+        depends_on:
+          - packaging-arm64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-arm64* . --step 'packaging-arm64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "azure"
+          image: "${IMAGE_WIN_11_ARM64}"
+          imageVersion: "${IMAGE_WIN_VERSION}"
+          vmSize: "Standard_D8ps_v6"
+          diskSizeGb: "256"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            variant: *windows_variants
+
+      - label: "windows:arm64:tier3:non-sudo:{{matrix.variant}}"
+        depends_on:
+          - packaging-arm64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-arm64* . --step 'packaging-arm64'
+          .buildkite/scripts/steps/integration_tests_tf.ps1 {{matrix.variant}} false
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        agents:
+          provider: "azure"
+          image: "${IMAGE_WIN_11_ARM64}"
+          imageVersion: "${IMAGE_WIN_VERSION}"
+          vmSize: "Standard_D8ps_v6"
+          diskSizeGb: "256"
+        retry:
+          automatic:
+            limit: 1
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            variant:
+              - default
+
+  - group: "Stateful: Linux (tier 1)"
+    if: build.pull_request.id != null
+    key: integration-tests-linux-tier-1
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Linux - tier 1"
+    depends_on:
+      - integration-ess
+    steps:
+      - label: "linux:amd64:tier1:non-sudo:{{matrix.variant}}"
+        depends_on:
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-linux-amd64'
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} false
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -329,20 +649,318 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_UBUNTU_2404_X86_64}"
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
-          - default
+          setup:
+            variant:
+              - default
 
-      - label: "x86_64:sudo: {{matrix}}"
+      - label: "linux:amd64:tier1:sudo:{{matrix.variant}}"
         depends_on:
-          - packaging-amd64
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "${IMAGE_UBUNTU_2404_X86_64}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            variant: *linux_variants
+
+      - label: "linux:amd64:tier1:sudo:{{matrix.variant}}"
+        depends_on:
+          - packaging-linux-amd64
+          - packaging-linux-amd64-deb-rpm
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          buildkite-agent artifact download build/distributions/elastic-agent-*-amd64.deb* . --step packaging-linux-amd64-deb-rpm
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "${IMAGE_UBUNTU_2404_X86_64}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            variant: *linux_deb_variants
+
+  - group: "Stateful: Linux (tier 2)"
+    if_changed:
+      include:
+        - .buildkite/**
+        - magefile.go
+        - dev-tools/**
+        - go.mod
+        - go.sum
+    key: integration-tests-linux-tier-2
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Linux - tier 2"
+    depends_on:
+      - integration-ess
+    steps:
+      - label: "linux:amd64:tier2:non-sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} false
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_DEBIAN_13}"
+            variant:
+              - default
+
+      - label: "linux:amd64:tier2:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_DEBIAN_13}"
+            variant: *linux_variants
+
+      - label: "linux:amd64:tier2:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+          - packaging-linux-amd64-deb-rpm
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          buildkite-agent artifact download build/distributions/elastic-agent-*-amd64.deb* . --step packaging-linux-amd64-deb-rpm
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_DEBIAN_13}"
+            variant: *linux_deb_variants
+
+      - label: "linux:amd64:tier2:{{matrix.sudo}}:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64-deb-rpm
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-x86_64.rpm* . --step packaging-linux-amd64-deb-rpm
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} {{matrix.sudo}}
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_RHEL_10}"
+            sudo:
+              - "true"
+              - "false"
+            variant: *linux_rpm_variants
+
+  - group: "Stateful: Linux (tier 3)"
+    key: integration-tests-linux-tier-3
+    # NOTE: as long as we use the scheduler pipeline we need to use BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG.
+    #       We use that pipeline to run the tier 3 tests on a schedule for the active branches.
+    if: build.source == "schedule" || build.env("BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG") == "elastic-agent-pipeline-scheduler"
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Linux - tier 3"
+    depends_on:
+      - integration-ess
+    steps:
+      - label: "linux:amd64:tier3:non-sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} false
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_UBUNTU_2204_X86_64}"
+              - "${IMAGE_UBUNTU_2404_X86_64}"
+              - "${IMAGE_UBUNTU_2604_X86_64}"
+              - "${IMAGE_DEBIAN_11}"
+            variant:
+              - default
+              - stress
+
+      - label: "linux:amd64:tier3:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_UBUNTU_2204_X86_64}"
+              - "${IMAGE_UBUNTU_2404_X86_64}"
+              - "${IMAGE_UBUNTU_2604_X86_64}"
+              - "${IMAGE_DEBIAN_11}"
+            variant: *linux_variants
+
+      - label: "linux:amd64:tier3:sudo:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64
+          - packaging-linux-amd64-deb-rpm
+        env:
+          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
+        command: |
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-linux-amd64
+          buildkite-agent artifact download build/distributions/elastic-agent-*-amd64.deb* . --step packaging-linux-amd64-deb-rpm
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
+        artifact_paths:
+          - build/*
+          - build/diagnostics/**
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          provider: "gcp"
+          machineType: "n2-standard-8"
+          image: "{{matrix.os}}"
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            os:
+              - "${IMAGE_UBUNTU_2204_X86_64}"
+              - "${IMAGE_UBUNTU_2404_X86_64}"
+              - "${IMAGE_UBUNTU_2604_X86_64}"
+              - "${IMAGE_DEBIAN_11}"
+            variant: *linux_deb_variants
+
+      - label: "linux:amd64:tier3:{{matrix.sudo}}:{{matrix.variant}}:{{matrix.os}}"
+        depends_on:
+          - packaging-linux-amd64-deb-rpm
         # due to deb group present in matrix tar.gz and deb packages artifacts are required
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-amd64
-          buildkite-agent artifact download build/distributions/elastic-agent-*-amd64.deb* . --step packaging-amd64
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix}} true
+          buildkite-agent artifact download build/distributions/elastic-agent-*-x86_64.rpm* . --step packaging-linux-amd64-deb-rpm
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} {{matrix.sudo}}
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -352,63 +970,50 @@ steps:
         agents:
           provider: "gcp"
           machineType: "n2-standard-8"
-          image: "${IMAGE_UBUNTU_2404_X86_64}"
+          image: "{{matrix.os}}"
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
-          - default
-          - upgrade
-          - upgrade-flavor
-          - standalone-upgrade
-          - fleet
-          - fleet-endpoint-security
-          - fleet-airgapped
-          - fleet-airgapped-privileged
-          - fleet-privileged
-          - fleet-upgrade-to-pr-build
-          - install-uninstall
-          - fqdn
-          - deb
-          - container
+          setup:
+            os:
+              - "${IMAGE_RHEL_8}"
+            sudo:
+              - "true"
+              - "false"
+            variant: *linux_rpm_variants
 
-      - label: "arm:sudo: {{matrix}}"
+      - label: "linux:arm64:tier3:sudo:{{matrix.variant}}:{{matrix.os}}"
         depends_on:
           - packaging-arm64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
           buildkite-agent artifact download build/distributions/elastic-agent-*-linux-arm64* . --step 'packaging-arm64'
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix}} true
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} true
         artifact_paths:
           - build/*
           - build/diagnostics/**
         agents:
           provider: "aws"
-          image: "${IMAGE_UBUNTU_2404_ARM_64}"
+          image: "{{matrix.os}}"
           instanceType: "m6g.2xlarge"
         retry:
           automatic:
             limit: 1
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
-          - default
-          - upgrade
-          - upgrade-flavor
-          - standalone-upgrade
-          - fleet
-          # ARM tests are enabled for only selected groups in order to save resources
-          # - fleet-endpoint-security
-          # - fleet-airgapped
-          # - fleet-airgapped-privileged
-          # - fleet-privileged
-          # - fleet-upgrade-to-pr-build
-          # - install-uninstall
-          # - fqdn
-          # - deb
-          # - container
+          setup:
+            os:
+              - "${IMAGE_UBUNTU_2404_ARM_64}"
+              - "${IMAGE_UBUNTU_2604_ARM_64}"
+            variant: *linux_arm_variants
 
-      - label: "arm:non-sudo: {{matrix}}"
+      - label: "linux:arm64:tier3:non-sudo:{{matrix.variant}}:{{matrix.os}}"
         skip: true
         depends_on:
           - packaging-arm64
@@ -416,7 +1021,7 @@ steps:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
         command: |
           buildkite-agent artifact download build/distributions/elastic-agent-*-linux-arm64* . --step 'packaging-arm64'
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix}} false
+          .buildkite/scripts/steps/integration_tests_oblt-cli.sh {{matrix.variant}} false
         artifact_paths:
           - build/*
           - build/diagnostics/**
@@ -425,138 +1030,31 @@ steps:
             limit: 1
         agents:
           provider: "aws"
-          image: "${IMAGE_UBUNTU_2404_ARM_64}"
+          image: "{{matrix.os}}"
           instanceType: "m6g.xlarge"
         plugins:
-          - *vault_ec_key_prod
-        matrix:
-          - default
-
-  - group: "Stateful:Debian"
-    key: integration-tests-debian
-    notify:
-      - github_commit_status:
-          context: "buildkite/elastic-agent-extended-testing - Debian"
-    depends_on:
-      - integration-ess
-    steps:
-      - label: "x86_64:non-sudo: {{matrix.group}} - {{matrix.image}}"
-        depends_on: packaging-amd64
-        env:
-          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-        command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-amd64'
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix.group}} false
-        artifact_paths:
-          - build/*
-          - build/diagnostics/**
-        retry:
-          automatic:
-            limit: 1
-        agents:
-          provider: "gcp"
-          machineType: "n2-standard-8"
-          image: "{{matrix.image}}"
-        plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
           setup:
-            image:
-              - "${IMAGE_DEBIAN_11}"
-              - "${IMAGE_DEBIAN_13}"
-            group:
+            os:
+              - "${IMAGE_UBUNTU_2404_ARM_64}"
+              - "${IMAGE_UBUNTU_2604_ARM_64}"
+            variant:
               - default
 
-      - label: "x86_64:sudo: {{matrix.group}} - {{matrix.image}}"
-        depends_on:
-          - packaging-amd64
-        # due to deb group present in matrix tar.gz and deb packages artifacts are required
-        env:
-          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-        command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step packaging-amd64
-          buildkite-agent artifact download build/distributions/elastic-agent-*-amd64.deb* . --step packaging-amd64
-          .buildkite/scripts/steps/integration_tests_tf.sh {{matrix.group}} true
-        artifact_paths:
-          - build/*
-          - build/diagnostics/**
-        retry:
-          automatic:
-            limit: 1
-        agents:
-          provider: "gcp"
-          machineType: "n2-standard-8"
-          image: "{{matrix.image}}"
-        plugins:
-          - *vault_ec_key_prod
-        matrix:
-          setup:
-            image:
-              - "${IMAGE_DEBIAN_11}"
-              - "${IMAGE_DEBIAN_13}"
-            group:
-              - default
-              - upgrade
-              - upgrade-flavor
-              - standalone-upgrade
-              - fleet
-              - fleet-endpoint-security
-              - fleet-airgapped
-              - fleet-airgapped-privileged
-              - fleet-privileged
-              - fleet-upgrade-to-pr-build
-              - install-uninstall
-              # FQDN test failing at debian 12. Relevant issue https://github.com/elastic/elastic-agent/issues/7476
-              #- fqdn
-              - deb
-              - container
-
-  - group: "Stateful:RHEL"
-    key: integration-tests-rhel
+  - group: ":kubernetes: Kubernetes (tier 1)"
+    key: integration-tests-kubernetes-tier-1
+    if: build.pull_request.id != null
     notify:
       - github_commit_status:
-          context: "buildkite/elastic-agent-extended-testing - RHEL"
-    depends_on:
-      - integration-ess
-    steps:
-      - label: "x86_64:sudo:rpm - {{matrix.image}}"
-        depends_on:
-          - packaging-amd64
-        env:
-          TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/ess"
-        command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-x86_64.rpm* . --step packaging-amd64
-          .buildkite/scripts/steps/integration_tests_tf.sh rpm true
-        artifact_paths:
-          - build/*
-          - build/diagnostics/**
-        retry:
-          automatic:
-            limit: 1
-        plugins:
-          - *vault_ec_key_prod
-        agents:
-          provider: "gcp"
-          machineType: "n2-standard-8"
-          image: "{{matrix.image}}"
-        matrix:
-          setup:
-            image:
-              - "${IMAGE_RHEL_8}"
-              - "${IMAGE_RHEL_10}"
-
-  - group: ":kubernetes: Kubernetes"
-    key: integration-tests-kubernetes
-    notify:
-      - github_commit_status:
-          context: "buildkite/elastic-agent-extended-testing - Kubernetes"
+          context: "buildkite/elastic-agent-extended-testing - Kubernetes - tier 1"
     depends_on:
       - integration-ess
       - packaging-containers-amd64
     steps:
-      - label: ":git: :kubernetes: {{matrix.version}}:amd64:{{matrix.variants}}"
-        # Run this step only if we are **not** building a PR (we use all supported k8s versions)
-        if: build.pull_request.id == null
+      - label: ":kubernetes:tier1:{{matrix.version}}:amd64:{{matrix.variants}}"
         env:
           *k8s_test_env
         command: *k8s_test_command
@@ -568,20 +1066,34 @@ steps:
         agents:
           *k8s_test_agent
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
           setup:
             variants:
-            - "basic,slim,complete,service,elastic-otel-collector"
-            - "wolfi,slim-wolfi,complete-wolfi,elastic-otel-collector-wolfi"
-            # See the Kubernetes Compatible Versions for Elastic Agent in the Elastic
-            # Support Matrix (https://www.elastic.co/support/matrix#matrix_kubernetes) for
-            # the rationale on why these specific versions are chosen.
+              *k8s_test_default_variants
             version:
               *k8s_test_versions
-      - label: ":open-pull-request: :kubernetes: {{matrix.version}}:amd64:{{matrix.variants}}"
-        # Run this step only if we are building a PR (we use only min/max k8s versions)
-        if: build.pull_request.id != null
+
+  - group: ":kubernetes: Kubernetes (tier 2)"
+    key: integration-tests-kubernetes-tier-2
+    if_changed:
+      include:
+        - .buildkite/**
+        - magefile.go
+        - deploy/**
+        - dev-tools/**
+        - go.mod
+        - go.sum
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Kubernetes - tier 2"
+    depends_on:
+      - integration-ess
+      - packaging-containers-amd64
+    steps:
+      - label: ":kubernetes:tier2:{{matrix.version}}:amd64:{{matrix.variants}}"
         env:
           *k8s_test_env
         command: *k8s_test_command
@@ -593,25 +1105,50 @@ steps:
         agents:
           *k8s_test_agent
         plugins:
-          - *vault_ec_key_prod
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
         matrix:
           setup:
             variants:
-              - basic
-              - slim
-              - complete
-              - service
-              - elastic-otel-collector
-              - wolfi
-              - slim-wolfi
-              - complete-wolfi
-              - elastic-otel-collector-wolfi
-            # See the Kubernetes Compatible Versions for Elastic Agent in the Elastic
-            # Support Matrix (https://www.elastic.co/support/matrix#matrix_kubernetes) for
-            # the rationale on why these specific versions are chosen.
+              *k8s_test_all_variants_without_default
             version:
               - *k8s_min_test_version
               - *k8s_max_test_version
+
+  - group: ":kubernetes: Kubernetes (tier 3)"
+    key: integration-tests-kubernetes-tier-3
+    # NOTE: as long as we use the scheduler pipeline we need to use BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG.
+    #       We use that pipeline to run the tier 3 tests on a schedule for the active branches.
+    if: build.source == "schedule" || build.env("BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG") == "elastic-agent-pipeline-scheduler"
+    notify:
+      - github_commit_status:
+          context: "buildkite/elastic-agent-extended-testing - Kubernetes - tier 3"
+    depends_on:
+      - integration-ess
+      - packaging-containers-amd64
+    steps:
+      - label: ":kubernetes:tier3:{{matrix.version}}:amd64:{{matrix.variants}}"
+        env:
+          *k8s_test_env
+        command: *k8s_test_command_with_sleep
+        artifact_paths:
+          *k8s_test_artifact_paths
+        retry:
+          automatic:
+            limit: 1
+        agents:
+          *k8s_test_agent
+        plugins:
+          - *google_oidc_observability_plugin
+          - *oblt_cli_plugin
+          - *vault_github_token
+        matrix:
+          setup:
+            variants:
+              *k8s_test_all_variants
+            version:
+              *k8s_test_versions_without_min_max
 
   - group: "Serverless integration test"
     key: integration-tests-serverless
@@ -621,11 +1158,11 @@ steps:
     steps:
       - label: "Windows:2022:amd64:sudo"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/serverless"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
           .buildkite/scripts/buildkite-integration-tests.ps1 fleet true
         artifact_paths:
           - build/*
@@ -638,16 +1175,17 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_WIN_2022}"
         plugins:
+          - *google_oidc_observability_plugin
           - *google_oidc_plugin
           - *gcp_serverless_secrets_plugin
 
       - label: "Windows:2025:amd64:sudo"
         depends_on:
-          - packaging-amd64
+          - packaging-windows-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/serverless"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-amd64'
+          buildkite-agent artifact download build/distributions/elastic-agent-*-windows-x86_64* . --step 'packaging-windows-amd64'
           .buildkite/scripts/buildkite-integration-tests.ps1 fleet true
         artifact_paths:
           - build/*
@@ -660,14 +1198,16 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_WIN_2025}"
         plugins:
+          - *google_oidc_observability_plugin
           - *google_oidc_plugin
           - *gcp_serverless_secrets_plugin
       - label: "Ubuntu:2404:amd64:sudo"
-        depends_on: packaging-amd64
+        depends_on:
+          - packaging-linux-amd64
         env:
           TEST_PACKAGE: "github.com/elastic/elastic-agent/testing/integration/serverless"
         command: |
-          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-amd64'
+          buildkite-agent artifact download build/distributions/elastic-agent-*-linux-x86_64* . --step 'packaging-linux-amd64'
           sudo -E .buildkite/scripts/buildkite-integration-tests.sh fleet true
         artifact_paths:
           - build/*
@@ -680,42 +1220,51 @@ steps:
           machineType: "n2-standard-8"
           image: "${IMAGE_UBUNTU_2404_X86_64}"
         plugins:
+          - *google_oidc_observability_plugin
           - *google_oidc_plugin
           - *gcp_serverless_secrets_plugin
 
   - label: ESS stack cleanup
     depends_on:
-      - integration-tests-ubuntu
-      - integration-tests-win
-      - integration-tests-rhel
-      - integration-tests-kubernetes
+      - integration-tests-kubernetes-tier-1
+      - integration-tests-kubernetes-tier-2
+      - integration-tests-kubernetes-tier-3
+      - integration-tests-linux-tier-1
+      - integration-tests-linux-tier-2
+      - integration-tests-linux-tier-3
+      - integration-tests-win-tier-1
+      - integration-tests-win-tier-2
+      - integration-tests-win-tier-3
       - extended-integration-tests
-      - integration-tests-debian
     allow_dependency_failure: true
     command: |
-      buildkite-agent artifact download "test_infra/ess/**" . --step "integration-ess"
-      ls -lah test_infra/ess
-      .buildkite/scripts/steps/ess_down.sh
+      .buildkite/scripts/steps/ess_cleanup_all.sh
     agents:
       image: "docker.elastic.co/ci-agent-images/platform-ingest/buildkite-agent-beats-ci-with-hooks:0.5"
       useCustomGlobalHooks: true
     plugins:
-      - *vault_ec_key_prod
+      - *google_oidc_observability_plugin
+      - *oblt_cli_plugin
+      - *vault_github_token
+
   - label: Aggregate test reports
     # Warning: The key has a hook in pre-command
     key: aggregate-reports
     depends_on:
       - integration-tests-ech
-      - integration-tests-ubuntu
-      - integration-tests-win
-      - integration-tests-rhel
-      - integration-tests-kubernetes
+      - integration-tests-kubernetes-tier-1
+      - integration-tests-kubernetes-tier-2
+      - integration-tests-kubernetes-tier-3
+      - integration-tests-linux-tier-1
+      - integration-tests-linux-tier-2
+      - integration-tests-linux-tier-3
+      - integration-tests-win-tier-1
+      - integration-tests-win-tier-2
+      - integration-tests-win-tier-3
       - integration-tests-serverless
-      - integration-tests-debian
     allow_dependency_failure: true
     command: |
       buildkite-agent artifact download "build/*.xml" .
-      buildkite-agent artifact download "build\*.xml" .
     agents:
       image: "docker.elastic.co/ci-agent-images/platform-ingest/buildkite-agent-beats-ci-with-hooks:0.5"
       useCustomGlobalHooks: true
@@ -729,5 +1278,8 @@ steps:
       - test-collector#v1.11.0:
           files: "build/*.xml"
           format: "junit"
-          branches: "main"
           debug: true
+          annotation-link: true
+          tags:
+            - "fips=false"
+      - *google_oidc_observability_plugin

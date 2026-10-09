@@ -5,10 +5,12 @@
 package mage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"go/build"
+	"io"
 	"log"
 	"os"
 	"path"
@@ -77,9 +79,9 @@ var BeatProjectType ProjectType
 func FuncMap(cfg *Settings) map[string]interface{} {
 	return map[string]interface{}{
 		"beat_doc_branch":                func() string { return cfg.DocBranch() },
-		"beat_version":                   func() string { return cfg.BeatQualifiedVersion() },
-		"commit":                         func() (string, error) { return cfg.Build.CommitHash() },
-		"commit_short":                   func() (string, error) { return cfg.Build.CommitHashShort() },
+		"agent_core_version":             func() string { return cfg.AgentQualifiedCoreVersion() },
+		"core_commit":                    func() string { return cfg.AgentCoreCommitHash() },
+		"core_commit_short":              func() string { return cfg.AgentCoreCommitHashShort() },
 		"date":                           func() string { return cfg.BuildDateString() },
 		"elastic_beats_dir":              func() string { return cfg.ElasticBeatsDir },
 		"go_version":                     func() string { return cfg.GoVersion() },
@@ -183,8 +185,8 @@ CI               = {{.CI}}
 ## Functions
 
 beat_doc_branch              = {{ beat_doc_branch }}
-beat_version                 = {{ beat_version }}
-commit                       = {{ commit }}
+agent_core_version           = {{ agent_core_version }}
+core_commit                  = {{ core_commit }}
 date                         = {{ date }}
 elastic_beats_dir            = {{ elastic_beats_dir }}
 go_version                   = {{ go_version }}
@@ -217,22 +219,14 @@ func (s *Settings) AgentPackageVersion() string {
 		return s.Packaging.AgentPackageVersion
 	}
 
-	return s.BeatQualifiedVersion()
+	return s.AgentQualifiedCoreVersion()
 }
 
 // PackageManifest generates the package manifest using the provided config.
 func PackageManifest(cfg *Settings, fips bool) (string, error) {
 	packageVersion := cfg.AgentPackageVersion()
-
-	hash, err := cfg.Build.CommitHash()
-	if err != nil {
-		return "", fmt.Errorf("retrieving agent commit hash: %w", err)
-	}
-
-	commitHashShort, err := cfg.Build.CommitHashShort()
-	if err != nil {
-		return "", fmt.Errorf("retrieving agent commit hash: %w", err)
-	}
+	hash := cfg.AgentCoreCommitHash()
+	commitHashShort := cfg.AgentCoreCommitHashShort()
 
 	return GeneratePackageManifest(cfg.Beat.Name, packageVersion, cfg.Build.Snapshot, hash, commitHashShort, fips, cfg.FlavorsRegistry)
 }
@@ -283,10 +277,10 @@ func GenerateSnapshotSuffix(snapshot bool) string {
 	return SnapshotSuffix
 }
 
-// BeatQualifiedVersion returns the Beat's qualified version.
-// If a version qualifier is set, it appends it to the version.
-func (s *Settings) BeatQualifiedVersion() string {
-	version := s.BeatVersion()
+// AgentQualifiedCoreVersion returns the agent-core version with the version qualifier appended,
+// if a version qualifier is set.
+func (s *Settings) AgentQualifiedCoreVersion() string {
+	version := s.AgentCoreVersion()
 	// version qualifier can intentionally be set to "" to override build time var
 	if !s.Build.VersionQualified || s.Build.VersionQualifier == "" {
 		return version
@@ -295,18 +289,18 @@ func (s *Settings) BeatQualifiedVersion() string {
 }
 
 var (
-	beatVersionRegex       = regexp.MustCompile(`(?m)^const defaultBeatVersion = "(.+)"\r?$`)
+	agentCoreVersionRegex  = regexp.MustCompile(`(?m)^const defaultBeatVersion = "(.+)"\r?$`)
 	beatDocBranchRegex     = regexp.MustCompile(`(?m)doc-branch:\s*([^\s]+)\r?$`)
 	beatDocSiteBranchRegex = regexp.MustCompile(`(?m)doc-site-branch:\s*([^\s]+)\r?$`)
 )
 
-func parseBeatVersion(data []byte) (string, error) {
-	matches := beatVersionRegex.FindSubmatch(data)
+func parseAgentCoreVersion(data []byte) (string, error) {
+	matches := agentCoreVersionRegex.FindSubmatch(data)
 	if len(matches) == 2 {
 		return string(matches[1]), nil
 	}
 
-	return "", errors.New("failed to parse beat version file")
+	return "", errors.New("failed to parse agent-core version from version/version.go")
 }
 
 func parseDocBranch(data []byte) (string, error) {
@@ -567,14 +561,34 @@ func listSrcGOPATHs() ([]string, error) {
 // settingsContextKey is the key used to store Settings in context.
 type settingsContextKey struct{}
 
+// LoadOptions configures optional behavior during settings loading.
+type LoadOptions struct {
+	// SkipVCS disables git-based initialization (commit hash lookup).
+	// Use this when running mage targets in a directory that is not a git
+	// repository and the commit hash is not needed.
+	SkipVCS bool
+}
+
 // SettingsFromContext returns the Settings from the context if present,
 // otherwise loads fresh settings from environment variables. This is the preferred
 // way to get settings in mage targets that receive a context.
 func SettingsFromContext(ctx context.Context) *Settings {
+	return SettingsFromContextWithOptions(ctx, LoadOptions{})
+}
+
+// SettingsFromContextWithOptions returns the Settings from the context if present,
+// otherwise loads fresh settings using the provided LoadOptions. Use this in mage
+// targets that need non-default load behaviour (e.g. LoadOptions{SkipVCS: true})
+// but still want to reuse already-loaded settings stored in the context.
+func SettingsFromContextWithOptions(ctx context.Context, opts LoadOptions) *Settings {
 	if s, ok := ctx.Value(settingsContextKey{}).(*Settings); ok && s != nil {
 		return s
 	}
-	return MustLoadSettings()
+	s, err := LoadSettingsWithOptions(opts)
+	if err != nil {
+		panic(fmt.Errorf("failed to load settings: %w", err))
+	}
+	return s
 }
 
 // ContextWithSettings returns a new context with the given Settings stored in it.
@@ -645,9 +659,9 @@ type Settings struct {
 	// Initialized during LoadSettings().
 	docBranch string
 
-	// beatVersion is the Beat version read from version/version.go.
+	// agentCoreVersion is the agent-core version read from version/version.go.
 	// Initialized during LoadSettings().
-	beatVersion string
+	agentCoreVersion string
 
 	// FlavorsRegistry is the map of flavors read from _meta/.flavors.
 	// Initialized during LoadSettings().
@@ -688,6 +702,11 @@ func (s *Settings) setBuildDefaults() {
 	s.Build.GOARCH = build.Default.GOARCH
 	s.Build.MaxParallel = runtime.NumCPU()
 	s.BuildDate = time.Now().UTC()
+	s.Build.Snapshot = true
+	// Default external-component fetching to on so `mage package` works from
+	// a fresh checkout without ceremony. Callers that don't want external
+	// fetches (e.g. a pre-populated AGENT_DROP_PATH flow) set EXTERNAL=false.
+	s.Build.ExternalBuild = true
 }
 
 // setBeatDefaults sets default values for BeatSettings.
@@ -710,22 +729,25 @@ func (s *Settings) setTestDefaults() {
 
 // setCrossBuildDefaults sets default values for CrossBuildSettings.
 func (s *Settings) setCrossBuildDefaults() {
-	s.CrossBuild.MountModcache = true
-	s.CrossBuild.MountBuildCache = true
-	s.CrossBuild.BuildCacheVolumeName = "elastic-agent-crossbuild-build-cache"
 	s.CrossBuild.DevOS = "linux"
 	s.CrossBuild.DevArch = "amd64"
 }
 
 // setPackagingDefaults sets default values for PackagingSettings.
-// Currently no non-zero defaults.
 func (s *Settings) setPackagingDefaults() {
-	// No non-zero defaults
+	// Reading .package-version is opt-in per mage target: only targets that
+	// call WithPackageVersionOverrides consume it. Default it to on so that
+	// `mage package` works from a fresh checkout without ceremony (the
+	// override pulls in the manifest URL, version and snapshot flag for the
+	// branch), while targets that never call WithPackageVersionOverrides
+	// ignore .package-version entirely. USE_PACKAGE_VERSION=false disables
+	// the overrides for the opt-in targets too.
+	s.Packaging.UsePackageVersion = true
 }
 
 // setIntegrationTestDefaults sets default values for IntegrationTestSettings.
 func (s *Settings) setIntegrationTestDefaults() {
-	s.IntegrationTest.CleanOnExit = true
+	s.IntegrationTest.CleanOnExit = false
 	s.IntegrationTest.TestEnvironmentEnabled = true
 }
 
@@ -849,22 +871,15 @@ func (s *Settings) WithAddedPackageType(pkgType PackageType) *Settings {
 	return clone
 }
 
-// WithBeatVersion returns a copy of the settings with the specified beat version.
-func (s *Settings) WithBeatVersion(version string) *Settings {
+// WithAgentCoreVersion returns a copy of the settings with the specified agent-core version.
+func (s *Settings) WithAgentCoreVersion(version string) *Settings {
 	clone := s.Clone()
-	clone.Build.BeatVersion = version
-	return clone
-}
-
-// WithAgentCommitHashOverride returns a copy of the settings with the specified commit hash override.
-func (s *Settings) WithAgentCommitHashOverride(hash string) *Settings {
-	clone := s.Clone()
-	clone.Build.AgentCommitHashOverride = hash
+	clone.Build.AgentCoreVersion = version
 	return clone
 }
 
 // WithManifestInfo downloads the manifest at ManifestURL and applies version information to a copy of
-// the settings. It sets Build.Snapshot, Build.BeatVersion, Build.AgentCommitHashOverride,
+// the settings. It sets Build.Snapshot, Build.AgentCoreVersion, Build.AgentCoreCommitHash,
 // Build.DependenciesVersion, and Packaging.Manifest. It is a no-op if ManifestURL is empty.
 func (s *Settings) WithManifestInfo(ctx context.Context) (*Settings, error) {
 	if s.Packaging.ManifestURL == "" {
@@ -889,9 +904,90 @@ func (s *Settings) WithManifestInfo(ctx context.Context) (*Settings, error) {
 	clone := s.Clone()
 	clone.Packaging.Manifest = &resp
 	clone.Build.Snapshot = parsedVersion.IsSnapshot()
-	clone.Build.BeatVersion = parsedVersion.CoreVersion()
-	clone.Build.AgentCommitHashOverride = agentCoreProject.CommitHash
+	clone.Build.AgentCoreVersion = parsedVersion.CoreVersion()
+	// VersionWithBuildMetadata preserves the build ID for Independent Agent Releases while
+	// omitting the prerelease — snapshot state is captured in Build.Snapshot.
+	clone.Packaging.AgentPackageVersion = parsedVersion.VersionWithBuildMetadata()
+	if clone.Packaging.CoreSource == CoreSourceManifest {
+		clone.Build.AgentCoreCommitHash = agentCoreProject.CommitHash
+	}
 	clone.Build.DependenciesVersion = parsedVersion.VersionWithPrerelease()
+	return clone, nil
+}
+
+// WithPackageVersionOverrides returns a copy of the settings with the
+// .package-version file's contents applied: the manifest URL, the package and
+// core versions, the snapshot flag, the integration-test agent/stack versions,
+// and a default agent drop path. Values provided explicitly via the
+// environment (AGENT_PACKAGE_VERSION, BEAT_VERSION, AGENT_VERSION,
+// AGENT_STACK_VERSION, AGENT_DROP_PATH) win over the file's.
+//
+// Reading .package-version is opt-in per mage target: only targets whose
+// output must stay consistent with the published snapshot build call this
+// (package and the targets built on it, downloadManifest, ironbank, the cloud
+// image targets, and the integration-test runners). All other targets never
+// read the file, so for example `SNAPSHOT=false mage helm:package` behaves as
+// written.
+//
+// USE_PACKAGE_VERSION=false disables the overrides for opt-in targets too. An
+// explicit MANIFEST_URL also disables them, since the manifest is then
+// authoritative for versions (combining MANIFEST_URL with an explicit
+// USE_PACKAGE_VERSION=true is rejected during settings loading).
+//
+// An explicit SNAPSHOT value that contradicts .package-version is an error
+// rather than silently overridden: packaging snapshot dependencies into an
+// artifact labeled as a release build (or vice versa) produces a broken
+// package.
+func (s *Settings) WithPackageVersionOverrides() (*Settings, error) {
+	if !s.Packaging.UsePackageVersion || s.Packaging.ManifestURL != "" {
+		return s, nil
+	}
+
+	pv, err := GetPackageVersionInfo(s)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", PackageVersionFilename, err)
+	}
+	if pv == nil {
+		return s, nil
+	}
+
+	parsedVersion, err := version.ParseVersion(pv.Version)
+	if err != nil {
+		return nil, fmt.Errorf("parsing version %q from %s: %w", pv.Version, PackageVersionFilename, err)
+	}
+	snapshot := parsedVersion.IsSnapshot()
+	if s.Build.SnapshotSet && s.Build.Snapshot != snapshot {
+		return nil, fmt.Errorf(
+			"SNAPSHOT=%v conflicts with %s (version %s): the package's snapshot flag must match its dependencies; "+
+				"set USE_PACKAGE_VERSION=false or provide MANIFEST_URL instead",
+			s.Build.Snapshot, PackageVersionFilename, pv.Version)
+	}
+
+	clone := s.Clone()
+	clone.Packaging.ManifestURL = pv.ManifestURL
+	clone.Build.Snapshot = snapshot
+	// AgentPackageVersion and AgentCoreVersion are both set from pv.CoreVersion
+	// because the full package's agent_package_version must match the core
+	// archive's agent_core_version (extractAgentCoreForPackage looks up the
+	// core archive by the same version). For packageAgentCore running as a
+	// dependency of package, this means the core archive is named with
+	// .package-version's version rather than version/version.go's; that is
+	// intentional.
+	if os.Getenv("AGENT_PACKAGE_VERSION") == "" {
+		clone.Packaging.AgentPackageVersion = pv.CoreVersion
+	}
+	if os.Getenv("BEAT_VERSION") == "" {
+		clone.Build.AgentCoreVersion = pv.CoreVersion
+	}
+	if os.Getenv("AGENT_VERSION") == "" {
+		clone.IntegrationTest.AgentVersion = pv.Version
+	}
+	if os.Getenv("AGENT_STACK_VERSION") == "" {
+		clone.IntegrationTest.AgentStackVersion = pv.StackVersion
+	}
+	if clone.Packaging.AgentDropPath == "" {
+		clone.Packaging.AgentDropPath = filepath.Join(clone.RepoInfo.RootDir, "build", "distributions", "elastic-agent-drop")
+	}
 	return clone, nil
 }
 
@@ -906,6 +1002,13 @@ func (s *Settings) WithAgentDropPath(path string) *Settings {
 func (s *Settings) WithStackProvisioner(provisioner string) *Settings {
 	clone := s.Clone()
 	clone.IntegrationTest.StackProvisioner = provisioner
+	return clone
+}
+
+// WithInstanceProvisioner returns a copy of the settings with the specified instance provisioner.
+func (s *Settings) WithInstanceProvisioner(provisioner string) *Settings {
+	clone := s.Clone()
+	clone.IntegrationTest.InstanceProvisioner = provisioner
 	return clone
 }
 
@@ -941,13 +1044,13 @@ type BuildSettings struct {
 	// GOARM is the ARM version for compilation (from GOARM env var)
 	GOARM string
 
-	// Snapshot indicates whether this is a snapshot build (from SNAPSHOT env var)
+	// Snapshot indicates whether this is a snapshot build (from SNAPSHOT env var, default true)
 	Snapshot bool
 
-	// SnapshotSet indicates whether SNAPSHOT env var was explicitly set.
-	// This is needed to distinguish "not set" from "explicitly set to false"
-	// in contexts where the default varies (e.g., cloud images default to true).
-	// TODO: consider refactoring to use *bool or restructuring context-specific defaults.
+	// SnapshotSet indicates whether the SNAPSHOT env var was explicitly set.
+	// This is needed to distinguish "not set" from "explicitly set to the
+	// default" so that WithPackageVersionOverrides can error on an explicit
+	// value that contradicts .package-version instead of silently ignoring it.
 	SnapshotSet bool
 
 	// DevBuild indicates whether this is a development build (from DEV env var)
@@ -977,18 +1080,31 @@ type BuildSettings struct {
 	// MaxParallel is the maximum number of parallel jobs (from MAX_PARALLEL env var)
 	MaxParallel int
 
-	// BeatVersion overrides the beat version (from BEAT_VERSION or set programmatically)
-	BeatVersion string
+	// AgentCoreVersion overrides the agent-core version (from BEAT_VERSION env var or set programmatically)
+	AgentCoreVersion string
 
-	// AgentCommitHashOverride overrides the commit hash for packaging (from AGENT_COMMIT_HASH_OVERRIDE or set programmatically)
-	AgentCommitHashOverride string
+	// AgentCoreCommitHash holds the commit hash of the elastic-agent-core package being wrapped into a
+	// full elastic-agent package. The agent-core hash appears in the package's "versioned home" directory
+	// layout (data/elastic-agent-<short-hash>/) and in the package manifest, so it must match the actual
+	// core that is being wrapped.
+	//
+	// When the core is built from the current source tree (the default), this can be left empty and the
+	// repository's git commit hash is used (see Settings.AgentCoreCommitHash). When wrapping a downloaded
+	// agent-core artifact (for example a DRA build identified via a manifest URL), the core's commit hash
+	// generally differs from this checkout, and it must be set here so packaging matches the core.
+	//
+	// This value is consumed only by the packaging code paths (templates and manifest generation). Binary
+	// builds always embed the actual repository git commit via BuildSettings.CommitHash().
+	//
+	// Set programmatically via WithManifestInfo, read from MANIFEST_URL.
+	AgentCoreCommitHash string
 
 	// DependenciesVersion is the version string used when resolving manifest dependency packages (VersionWithPrerelease).
 	// Populated by WithManifestInfo when ManifestURL is set.
 	DependenciesVersion string
 
-	// commitHash is the commit hash of the current build. Can be overridden via the AGENT_COMMIT_HASH_OVERRIDE env var.
-	// We lazy load this value, because inside crossbuild containers, fetching it can fail.
+	// commitHash is the git commit hash of the current source tree.
+	// Populated by Settings.initCommitHash() during LoadSettings().
 	commitHash string
 
 	// GolangCrossBuild indicates we're inside a golang-crossbuild container (from GOLANG_CROSSBUILD env var)
@@ -1001,29 +1117,43 @@ type BuildSettings struct {
 	BeatDocBranch string
 }
 
-func (bs *BuildSettings) CommitHash() (string, error) {
-	if bs.AgentCommitHashOverride != "" {
-		return bs.AgentCommitHashOverride, nil
-	}
-	if bs.commitHash == "" {
-		var err error
-		bs.commitHash, err = sh.Output("git", "rev-parse", "HEAD")
-		if err != nil {
-			return "", fmt.Errorf("failed to get commit hash: %w", err)
-		}
-	}
-	return bs.commitHash, nil
+// CommitHash returns the git commit hash of the current source tree. This is the value to embed in
+// binaries built from this checkout. It does not respect AgentCoreCommitHash — packaging code that
+// must match the agent-core layout should call Settings.AgentCoreCommitHash() instead.
+// The hash is populated during LoadSettings(); returns an empty string on a zero-value BuildSettings.
+func (bs *BuildSettings) CommitHash() string {
+	return bs.commitHash
 }
 
-func (bs *BuildSettings) CommitHashShort() (string, error) {
-	shortHash, err := bs.CommitHash()
-	if err != nil {
-		return "", err
+// CommitHashShort returns the first 6 characters of the git commit hash.
+// It does not respect AgentCoreCommitHash — use Settings.AgentCoreCommitHashShort() for packaging.
+func (bs *BuildSettings) CommitHashShort() string {
+	h := bs.commitHash
+	if len(h) > 6 {
+		return h[:6]
 	}
-	if len(shortHash) > 6 {
-		shortHash = shortHash[:6]
+	return h
+}
+
+// AgentCoreCommitHash returns the commit hash of the agent-core package being wrapped. When
+// Build.AgentCoreCommitHash is set (e.g. when packaging a downloaded core from a DRA manifest), that
+// value is returned; otherwise the current repository's git commit hash is returned (which is correct
+// when the core is being built from this same checkout). This is the hash that should appear in the
+// package's "versioned home" directory and manifest.
+func (s *Settings) AgentCoreCommitHash() string {
+	if s.Build.AgentCoreCommitHash != "" {
+		return s.Build.AgentCoreCommitHash
 	}
-	return shortHash, nil
+	return s.Build.CommitHash()
+}
+
+// AgentCoreCommitHashShort returns the first 6 characters of AgentCoreCommitHash.
+func (s *Settings) AgentCoreCommitHashShort() string {
+	h := s.AgentCoreCommitHash()
+	if len(h) > 6 {
+		return h[:6]
+	}
+	return h
 }
 
 // BeatSettings contains Beat metadata settings.
@@ -1076,21 +1206,33 @@ type CrossBuildSettings struct {
 	// DockerVariants is the comma-separated list of Docker variants (from DOCKER_VARIANTS env var)
 	DockerVariants string
 
-	// MountModcache enables mounting $GOPATH/pkg/mod into crossbuild containers (from CROSSBUILD_MOUNT_MODCACHE env var)
-	MountModcache bool
-
-	// MountBuildCache enables mounting Go build cache into crossbuild containers (from CROSSBUILD_MOUNT_GOCACHE env var)
-	MountBuildCache bool
-
-	// BuildCacheVolumeName is the Docker volume name for the build cache
-	BuildCacheVolumeName string
-
 	// DevOS is the target OS for config generation (from DEV_OS env var, default "linux")
 	DevOS string
 
 	// DevArch is the target architecture for config generation (from DEV_ARCH env var, default "amd64")
 	DevArch string
 }
+
+// CoreSource selects where the elastic-agent-core binaries used by Package
+// come from. The choice also determines which commit is authoritative for the
+// resulting artifact's metadata: CoreSourceLocal uses git HEAD (the commit
+// the local compile baked into the binary), CoreSourceManifest uses the
+// manifest's core commit (the commit the already-published binary was built
+// at).
+type CoreSource string
+
+const (
+	// CoreSourceLocal compiles elastic-agent-core from the current repository
+	// checkout via PackageAgentCore. AgentCoreCommitHash() returns git HEAD,
+	// which matches the commit the compiler baked into the binary.
+	CoreSourceLocal CoreSource = "local"
+
+	// CoreSourceManifest downloads a pre-built elastic-agent-core archive
+	// from the manifest. Requires MANIFEST_URL to be set.
+	// AgentCoreCommitHash() returns the manifest's core commit, which matches
+	// the commit the downloaded binary was built at.
+	CoreSourceManifest CoreSource = "manifest"
+)
 
 // PackagingSettings contains packaging-related settings.
 type PackagingSettings struct {
@@ -1103,14 +1245,25 @@ type PackagingSettings struct {
 	// Manifest is the downloaded manifest response. Populated by WithManifestInfo when ManifestURL is set.
 	Manifest *manifest.Build
 
-	// UsePackageVersion enables reading version from .package-version file (from USE_PACKAGE_VERSION env var)
+	// UsePackageVersion enables reading version from .package-version file (from USE_PACKAGE_VERSION env var).
+	// Only consulted by targets that call WithPackageVersionOverrides; it has no
+	// effect on any other target.
 	UsePackageVersion bool
+
+	// UsePackageVersionSet indicates whether the USE_PACKAGE_VERSION env var was
+	// explicitly set, distinguishing an explicit opt-in from the default when
+	// combined with MANIFEST_URL (explicit true + MANIFEST_URL is an error).
+	UsePackageVersionSet bool
 
 	// AgentDropPath is the path for dropping agent artifacts (from AGENT_DROP_PATH env var)
 	AgentDropPath string
 
 	// KeepArchive indicates whether to keep the archive after packaging (from KEEP_ARCHIVE env var)
 	KeepArchive bool
+
+	// CoreSource selects where elastic-agent-core comes from when running
+	// Package. Defaults to CoreSourceLocal (from AGENT_CORE_SOURCE env var).
+	CoreSource CoreSource
 }
 
 // IntegrationTestSettings contains integration test related settings.
@@ -1201,6 +1354,10 @@ type IntegrationTestSettings struct {
 	// TestEnvironmentEnabled indicates if the test environment is enabled (from TEST_ENVIRONMENT env var).
 	// Defaults to true if not set.
 	TestEnvironmentEnabled bool
+
+	// AgentDevelop enables development mode for the agent fixture (from TEST_AGENT_DEVELOP env var).
+	// When true, --develop is passed to elastic-agent. Only applies to local runs by default.
+	AgentDevelop string
 }
 
 // DockerSettings contains Docker-related settings.
@@ -1263,6 +1420,13 @@ func MustLoadSettings() *Settings {
 // LoadSettings reads all settings from environment variables and returns a new Settings.
 // Each call returns a fresh settings with defaults, then overridden by environment variables.
 func LoadSettings() (*Settings, error) {
+	return LoadSettingsWithOptions(LoadOptions{})
+}
+
+// LoadSettingsWithOptions reads all settings from environment variables and returns a new Settings,
+// respecting the provided LoadOptions. Use LoadOptions.SkipVCS to skip git-based initialization
+// when running in a directory that is not a git repository.
+func LoadSettingsWithOptions(opts LoadOptions) (*Settings, error) {
 	s := DefaultSettings()
 
 	if err := s.loadBuildSettingsFromEnv(); err != nil {
@@ -1283,7 +1447,9 @@ func LoadSettings() (*Settings, error) {
 		return nil, fmt.Errorf("initializing repo info: %w", err)
 	}
 
-	s.loadPackagingSettingsFromEnv()
+	if err := s.loadPackagingSettingsFromEnv(); err != nil {
+		return nil, fmt.Errorf("loading packaging settings: %w", err)
+	}
 	if err := s.loadIntegrationTestSettingsFromEnv(); err != nil {
 		return nil, fmt.Errorf("loading integration test settings: %w", err)
 	}
@@ -1300,8 +1466,37 @@ func LoadSettings() (*Settings, error) {
 	if err := s.initBuildVariables(); err != nil {
 		return nil, fmt.Errorf("initializing build variables: %w", err)
 	}
+	if !opts.SkipVCS {
+		if err := s.initCommitHash(); err != nil {
+			return nil, fmt.Errorf("initializing commit hash: %w", err)
+		}
+	}
 
 	return s, nil
+}
+
+// initCommitHash loads the current git commit hash into Build.commitHash.
+func (s *Settings) initCommitHash() error {
+	// we might be running this in a crossbuild container and it may return an error, suppress it from stderr
+	// to avoid clogging up the command output
+	buf := &bytes.Buffer{}
+	_, err := sh.Exec(nil, buf, io.Discard, "git", "rev-parse", "HEAD")
+	hash := strings.TrimSuffix(buf.String(), "\n")
+	if err != nil && s.Build.GolangCrossBuild {
+		// Inside golang-crossbuild containers, git refuses to operate in directories owned
+		// by a different user until safe.directory is configured. Configure it now so we
+		// can read the commit hash. devtools.GolangCrossBuild() also does this before Build(),
+		// but that is too late since initCommitHash runs during LoadSettings().
+		if configErr := sh.Run("git", "config", "--global", "--add", "safe.directory", s.RepoInfo.RootDir); configErr != nil {
+			return fmt.Errorf("failed to configure git safe.directory in crossbuild context: %w", configErr)
+		}
+		hash, err = sh.Output("git", "rev-parse", "HEAD")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get commit hash: %w", err)
+	}
+	s.Build.commitHash = strings.TrimSpace(hash)
+	return nil
 }
 
 // loadBuildSettingsFromEnv overrides build settings from environment variables.
@@ -1348,11 +1543,7 @@ func (s *Settings) loadBuildSettingsFromEnv() error {
 	}
 
 	if v := os.Getenv("BEAT_VERSION"); v != "" {
-		s.Build.BeatVersion = v
-	}
-
-	if v := os.Getenv("AGENT_COMMIT_HASH_OVERRIDE"); v != "" {
-		s.Build.AgentCommitHashOverride = v
+		s.Build.AgentCoreVersion = v
 	}
 
 	s.Build.GolangCrossBuild = os.Getenv("GOLANG_CROSSBUILD") == "1"
@@ -1441,12 +1632,6 @@ func (s *Settings) loadCrossBuildSettingsFromEnv() {
 	if v := os.Getenv("DOCKER_VARIANTS"); v != "" {
 		s.CrossBuild.DockerVariants = v
 	}
-	if v, ok := os.LookupEnv("CROSSBUILD_MOUNT_MODCACHE"); ok {
-		s.CrossBuild.MountModcache = v == "true"
-	}
-	if v, ok := os.LookupEnv("CROSSBUILD_MOUNT_GOCACHE"); ok {
-		s.CrossBuild.MountBuildCache = v == "true"
-	}
 	if v := os.Getenv("DEV_OS"); v != "" {
 		s.CrossBuild.DevOS = v
 	}
@@ -1457,15 +1642,28 @@ func (s *Settings) loadCrossBuildSettingsFromEnv() {
 
 // loadPackagingSettingsFromEnv overrides packaging settings from environment variables.
 // Defaults should already be set via setPackagingDefaults().
-func (s *Settings) loadPackagingSettingsFromEnv() {
+func (s *Settings) loadPackagingSettingsFromEnv() error {
 	if v := os.Getenv("AGENT_PACKAGE_VERSION"); v != "" {
 		s.Packaging.AgentPackageVersion = v
 	}
-	if v := os.Getenv("MANIFEST_URL"); v != "" {
+	manifestURLSet := false
+	if v, ok := os.LookupEnv("MANIFEST_URL"); ok && v != "" {
 		s.Packaging.ManifestURL = v
+		manifestURLSet = true
 	}
-	if os.Getenv("USE_PACKAGE_VERSION") == "true" {
-		s.Packaging.UsePackageVersion = true
+	var err error
+	_, s.Packaging.UsePackageVersionSet = os.LookupEnv("USE_PACKAGE_VERSION")
+	s.Packaging.UsePackageVersion, err = parseBoolEnv("USE_PACKAGE_VERSION", s.Packaging.UsePackageVersion)
+	if err != nil {
+		return fmt.Errorf("failed to parse USE_PACKAGE_VERSION: %w", err)
+	}
+	// An explicit MANIFEST_URL is authoritative and makes
+	// WithPackageVersionOverrides a no-op, so only reject the combination when
+	// USE_PACKAGE_VERSION=true was explicitly requested alongside it.
+	if manifestURLSet && s.Packaging.UsePackageVersionSet && s.Packaging.UsePackageVersion {
+		return errors.New("MANIFEST_URL and USE_PACKAGE_VERSION=true are mutually exclusive: " +
+			"USE_PACKAGE_VERSION reads .package-version to set the manifest URL; " +
+			"unset USE_PACKAGE_VERSION when providing MANIFEST_URL explicitly")
 	}
 	if v := os.Getenv("AGENT_DROP_PATH"); v != "" {
 		s.Packaging.AgentDropPath = v
@@ -1473,31 +1671,16 @@ func (s *Settings) loadPackagingSettingsFromEnv() {
 	if _, ok := os.LookupEnv("KEEP_ARCHIVE"); ok {
 		s.Packaging.KeepArchive = true
 	}
-
-	// Apply .package-version overrides when USE_PACKAGE_VERSION is set.
-	// This mirrors the old initPackageVersion() behavior: read the file,
-	// set ManifestURL / AgentDropPath so the
-	// packaging path downloads components from the manifest instead of
-	// fetching them individually. Values from the .package-version file
-	// take precedence over environment variables.
-	if s.Packaging.UsePackageVersion {
-		pv, err := GetPackageVersionInfo(s)
-		if err != nil {
-			log.Printf("Warning: failed to get package version info: %v", err)
-		}
-		if pv != nil {
-			s.Packaging.ManifestURL = pv.ManifestURL
-			s.Packaging.AgentPackageVersion = pv.CoreVersion
-			s.Build.BeatVersion = pv.CoreVersion
-			s.Build.Snapshot = true
-			s.IntegrationTest.AgentVersion = pv.Version
-			s.IntegrationTest.AgentStackVersion = pv.StackVersion
-
-			if s.Packaging.AgentDropPath == "" {
-				s.Packaging.AgentDropPath = filepath.Join(s.RepoInfo.RootDir, "build", "distributions", "elastic-agent-drop")
-			}
-		}
+	switch v := os.Getenv("AGENT_CORE_SOURCE"); v {
+	case "", string(CoreSourceLocal):
+		s.Packaging.CoreSource = CoreSourceLocal
+	case string(CoreSourceManifest):
+		s.Packaging.CoreSource = CoreSourceManifest
+	default:
+		return fmt.Errorf("unknown AGENT_CORE_SOURCE=%s", v)
 	}
+
+	return nil
 }
 
 // loadIntegrationTestSettingsFromEnv overrides integration test settings from environment variables.
@@ -1560,7 +1743,9 @@ func (s *Settings) loadIntegrationTestSettingsFromEnv() error {
 	if os.Getenv("TEST_RUN_UNTIL_FAILURE") == "true" {
 		s.IntegrationTest.RunUntilFailure = true
 	}
-	if os.Getenv("TEST_INTEG_CLEAN_ON_EXIT") == "false" {
+	if v := os.Getenv("TEST_INTEG_CLEAN_ON_EXIT"); v == "true" {
+		s.IntegrationTest.CleanOnExit = true
+	} else if v == "false" {
 		s.IntegrationTest.CleanOnExit = false
 	}
 	if v := os.Getenv("TEST_LONG_RUNNING"); v != "" {
@@ -1583,6 +1768,9 @@ func (s *Settings) loadIntegrationTestSettingsFromEnv() error {
 	}
 	if v := os.Getenv("GOTEST_FLAGS"); v != "" {
 		s.IntegrationTest.GoTestFlags = v
+	}
+	if v := os.Getenv("TEST_AGENT_DEVELOP"); v != "" {
+		s.IntegrationTest.AgentDevelop = v
 	}
 
 	var err error
@@ -1696,15 +1884,15 @@ func (s *Settings) initBuildVariables() error {
 		return fmt.Errorf("failed to parse doc branch: %w", err)
 	}
 
-	// Load beat version from version/version.go
-	beatVersionFile := filepath.Join(s.ElasticBeatsDir, "version", "version.go")
-	data, err = os.ReadFile(beatVersionFile)
+	// Load agent-core version from version/version.go
+	agentCoreVersionFile := filepath.Join(s.ElasticBeatsDir, "version", "version.go")
+	data, err = os.ReadFile(agentCoreVersionFile)
 	if err != nil {
-		return fmt.Errorf("failed to read beat version file=%v: %w", beatVersionFile, err)
+		return fmt.Errorf("failed to read agent-core version file=%v: %w", agentCoreVersionFile, err)
 	}
-	s.beatVersion, err = parseBeatVersion(data)
+	s.agentCoreVersion, err = parseAgentCoreVersion(data)
 	if err != nil {
-		return fmt.Errorf("failed to parse beat version: %w", err)
+		return fmt.Errorf("failed to parse agent-core version: %w", err)
 	}
 
 	// Load flavors registry from _meta/.flavors
@@ -1773,14 +1961,14 @@ func (s *Settings) DocBranch() string {
 	return s.docBranch
 }
 
-// BeatVersion returns the Beat version.
-// If Build.BeatVersion override is set, it returns that value.
-// Otherwise returns the value loaded from the version file.
-func (s *Settings) BeatVersion() string {
-	if s.Build.BeatVersion != "" {
-		return s.Build.BeatVersion
+// AgentCoreVersion returns the agent-core version.
+// If Build.AgentCoreVersion override is set, it returns that value.
+// Otherwise returns the value loaded from version/version.go.
+func (s *Settings) AgentCoreVersion() string {
+	if s.Build.AgentCoreVersion != "" {
+		return s.Build.AgentCoreVersion
 	}
-	return s.beatVersion
+	return s.agentCoreVersion
 }
 
 // BuildDateString returns a formatted build date.
@@ -1789,7 +1977,11 @@ func (s *Settings) BuildDateString() string {
 }
 
 // GetPlatforms returns the parsed platform list from PLATFORMS env var.
-// If PLATFORMS is empty, returns the default platform list.
+// If PLATFORMS is empty, returns the host platform (runtime.GOOS/runtime.GOARCH)
+// when that platform is known, or BuildPlatforms.Defaults() as a fallback for
+// exotic hosts. This makes `mage package` produce host-only artifacts by
+// default; callers that want a broader matrix (CI cross-builds) set PLATFORMS
+// explicitly.
 // Platform filters from the settings' PlatformFilters are applied to the result.
 // Note: linux/386 and windows/386 are always filtered out as they are not supported.
 func (s *Settings) GetPlatforms() BuildPlatformList {
@@ -1797,7 +1989,12 @@ func (s *Settings) GetPlatforms() BuildPlatformList {
 	if s.CrossBuild.Platforms != "" {
 		platforms = NewPlatformList(s.CrossBuild.Platforms)
 	} else {
-		platforms = BuildPlatforms.Defaults()
+		hostName := runtime.GOOS + "/" + runtime.GOARCH
+		if bp, ok := BuildPlatforms.Get(hostName); ok {
+			platforms = BuildPlatformList{bp}
+		} else {
+			platforms = BuildPlatforms.Defaults()
+		}
 	}
 
 	// Filter out unsupported platforms
@@ -1815,7 +2012,9 @@ func (s *Settings) GetPlatforms() BuildPlatformList {
 // GetPackageTypes returns the package types to use.
 // If SelectedPackageTypes is set in the settings, returns that.
 // Otherwise parses from PACKAGES env var.
-// If PACKAGES is empty, returns nil (meaning all package types are selected).
+// If PACKAGES is "all", returns all available package types.
+// If PACKAGES is empty, returns a platform-derived default: tar.gz for non-Windows
+// platforms and zip for Windows platforms.
 func (s *Settings) GetPackageTypes() []PackageType {
 	// Check settings override first
 	if s.SelectedPackageTypes != nil {
@@ -1823,7 +2022,10 @@ func (s *Settings) GetPackageTypes() []PackageType {
 	}
 	// Fall back to env var
 	if s.CrossBuild.Packages == "" {
-		return nil
+		return s.defaultPackageTypesForPlatforms()
+	}
+	if strings.ToLower(s.CrossBuild.Packages) == "all" {
+		return AllPackageTypes
 	}
 	var types []PackageType
 	for _, pkgtype := range strings.Split(s.CrossBuild.Packages, ",") {
@@ -1831,6 +2033,28 @@ func (s *Settings) GetPackageTypes() []PackageType {
 		if err := p.UnmarshalText([]byte(pkgtype)); err == nil {
 			types = append(types, p)
 		}
+	}
+	return types
+}
+
+// defaultPackageTypesForPlatforms returns the default package types derived from the
+// configured platforms: tar.gz for non-Windows platforms, zip for Windows platforms.
+func (s *Settings) defaultPackageTypesForPlatforms() []PackageType {
+	platforms := s.GetPlatforms()
+	var hasUnix, hasWindows bool
+	for _, p := range platforms {
+		if p.GOOS() == "windows" {
+			hasWindows = true
+		} else {
+			hasUnix = true
+		}
+	}
+	var types []PackageType
+	if hasUnix {
+		types = append(types, TarGz)
+	}
+	if hasWindows {
+		types = append(types, Zip)
 	}
 	return types
 }

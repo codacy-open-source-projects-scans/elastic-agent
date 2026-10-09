@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,14 +20,16 @@ import (
 
 	"github.com/elastic/elastic-agent/internal/pkg/composable"
 
-	"github.com/elastic/elastic-agent/internal/pkg/core/backoff"
+	monitoringCfg "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/otel/translate"
 	"github.com/elastic/elastic-agent/internal/pkg/release"
+	"github.com/elastic/elastic-agent/pkg/backoff"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/status"
 
 	"go.elastic.co/apm/v2"
 	"go.opentelemetry.io/collector/confmap"
+	gproto "google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v2"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
@@ -39,7 +41,6 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/reexec"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade"
 	upgradeErrors "github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/artifact/download/errors"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/protection"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
@@ -47,7 +48,7 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/capabilities"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
 	"github.com/elastic/elastic-agent/internal/pkg/diagnostics"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
+	internalfleetapi "github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker"
 	fleetapiClient "github.com/elastic/elastic-agent/internal/pkg/fleetapi/client"
 	"github.com/elastic/elastic-agent/pkg/component"
@@ -55,8 +56,11 @@ import (
 	agentclient "github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
+	"github.com/elastic/elastic-agent/pkg/ecsmeta"
 	"github.com/elastic/elastic-agent/pkg/features"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/limits"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/pkg/utils/broadcaster"
 )
 
@@ -74,6 +78,13 @@ var ErrFleetServer = errors.New("unsupported action: agent runs Fleet server")
 // ErrNotUpgradable error is returned when upgrade cannot be performed.
 var ErrNotUpgradable = errors.New(
 	"cannot be upgraded; must be installed with install sub-command and " +
+		"running under control of the systems supervisor")
+
+// ErrNotRestartable error is returned when a restart cannot be performed
+// because the agent is not running in an environment where a re-execution
+// would be recovered.
+var ErrNotRestartable = errors.New(
+	"cannot be restarted; must be installed with install sub-command and " +
 		"running under control of the systems supervisor")
 
 // ErrUpgradeInProgress error is returned if two or more upgrades are
@@ -95,7 +106,7 @@ type UpgradeManager interface {
 	Reload(rawConfig *config.Config) error
 
 	// Upgrade upgrades running agent.
-	Upgrade(ctx context.Context, version string, rollback bool, sourceURI string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes ...string) (_ reexec.ShutdownCallbackFn, err error)
+	Upgrade(ctx context.Context, version string, rollback bool, sources []string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes []string, opts ...upgrade.Option) (_ reexec.ShutdownCallbackFn, err error)
 
 	// Ack is used on startup to check if the agent has upgraded and needs to send an ack for the action
 	Ack(ctx context.Context, acker acker.Acker) error
@@ -164,7 +175,7 @@ type OTelManager interface {
 	Runner
 
 	// Update updates the current plain configuration for the otel collector and components.
-	Update(*confmap.Conf, *configuration.SettingsConfig, logp.Level, []component.Component)
+	Update(*confmap.Conf, *monitoringCfg.MonitoringConfig, logp.Level, []component.Component)
 
 	// WatchCollector returns a channel to watch for collector status updates.
 	WatchCollector() <-chan *status.AggregateStatus
@@ -183,6 +194,9 @@ type OTelManager interface {
 	// PerformComponentDiagnostics executes the diagnostic action for the provided components. If no components are provided,
 	// then it performs the diagnostics for all current units.
 	PerformComponentDiagnostics(ctx context.Context, additionalMetrics []cproto.AdditionalDiagnosticRequest, req ...component.Component) ([]runtime.ComponentDiagnostic, error)
+
+	// PerformAction executes a Fleet action for the specified component and unit.
+	PerformAction(ctx context.Context, comp component.Component, unit component.Unit, name string, params map[string]interface{}) (map[string]interface{}, error)
 }
 
 // ConfigChange provides an interface for receiving a new configuration.
@@ -331,6 +345,12 @@ type Coordinator struct {
 	upgradeMgr UpgradeManager
 	monitorMgr MonitorManager
 
+	// canReExec reports whether a re-execution of the process will be recovered
+	// (installed and running under a system supervisor). It is a field so tests
+	// can override it; it defaults to reexec.CanReExec. Both the upgrade path
+	// (via UpgradeManager.Upgradeable) and the restart path rely on this check.
+	canReExec func() bool
+
 	monitoringServerReloader configReloader
 
 	runtimeMgr RuntimeManager
@@ -408,10 +428,10 @@ type Coordinator struct {
 	// failures immediately https://github.com/elastic/elastic-agent/issues/2887.
 	// For now, we track three distinct errors for those three failure types,
 	// and merge them into a readable error in generateReportableState.
-	configErr        error
-	componentGenErr  error
-	runtimeUpdateErr error
-	otelErr          error
+	configErr         error
+	componentModelErr error
+	runtimeUpdateErr  error
+	otelErr           error
 
 	// The raw policy before spec lookup or variable substitution
 	ast *transpiler.AST
@@ -421,6 +441,13 @@ type Coordinator struct {
 
 	// The policy after spec and variable substitution
 	derivedConfig map[string]interface{}
+
+	// renderCache reuses the rendered inputs of the previous refresh for the (input, vars)
+	// pairs that did not change. It is reset whenever ast changes.
+	renderCache *transpiler.RenderCache
+	// expectedConfigCache reuses the unit configurations of the previous refresh for the
+	// units whose configuration did not change.
+	expectedConfigCache *component.ExpectedConfigCache
 
 	// The final component model generated from ast and vars (this is the same
 	// value that is sent to the runtime manager).
@@ -538,6 +565,7 @@ func New(
 		FleetState:     fleetState,
 		FleetMessage:   fleetMessage,
 		LogLevel:       logLevel,
+		Tags:           agentInfo.GetTags(),
 		UpgradeDetails: initialUpgradeDetails,
 	}
 	c := &Coordinator{
@@ -583,6 +611,10 @@ func New(
 
 		fleetAcker:       fleetAcker,
 		secretMarkerFunc: diagnostics.AddSecretMarkers,
+		canReExec:        reexec.CanReExec,
+
+		renderCache:         transpiler.NewRenderCache(),
+		expectedConfigCache: component.NewExpectedConfigCache(),
 	}
 	// Setup communication channels for any non-nil components. This pattern
 	// lets us transparently accept nil managers / simulated events during
@@ -693,6 +725,23 @@ func (c *Coordinator) ReExec(callback reexec.ShutdownCallbackFn, argOverrides ..
 	c.reexecMgr.ReExec(callback, argOverrides...)
 }
 
+// Restart re-executes the agent to fulfil a RESTART action. It reuses the same
+// re-exec machinery as an upgrade, but performs no upgrade steps (no download,
+// marker, or version change). Unlike an upgrade it does not consider the
+// release-level upgrade flag; it only requires that a re-execution will be
+// recovered (canReExec). The action is not acknowledged here; it is
+// acknowledged on the next startup by the managed config manager.
+// Called from external goroutines.
+func (c *Coordinator) Restart(_ context.Context, _ *fleetapi.ActionRestart) error {
+	if !c.canReExec() {
+		return ErrNotRestartable
+	}
+
+	// ReExec sets the override state to Stopping and performs the re-execution.
+	c.ReExec(nil)
+	return nil
+}
+
 // Migrate migrates agent to a new cluster and ACKs success to the old one.
 // In case of failure no ack is performed and error is returned.
 func (c *Coordinator) Migrate(
@@ -743,7 +792,7 @@ func (c *Coordinator) Migrate(
 	}
 
 	// Target is checked prior to enroll
-	if err := fleetapiClient.CheckRemote(ctx, newFleetClient); err != nil {
+	if err := fleetapiClient.CheckRemote(ctx, c.logger, newFleetClient); err != nil {
 		return err
 	}
 
@@ -835,7 +884,7 @@ type upgradeOpts struct {
 	skipVerifyOverride bool
 	skipDefaultPgp     bool
 	pgpBytes           []string
-	preUpgradeCallback func(ctx context.Context, log *logger.Logger, action *fleetapi.ActionUpgrade) error
+	upgradeOpts        []upgrade.Option
 	rollback           bool
 }
 
@@ -861,7 +910,7 @@ func WithPgpBytes(pgpBytes []string) UpgradeOpt {
 
 func WithPreUpgradeCallback(preUpgradeCallback func(ctx context.Context, log *logger.Logger, action *fleetapi.ActionUpgrade) error) UpgradeOpt {
 	return func(opts *upgradeOpts) {
-		opts.preUpgradeCallback = preUpgradeCallback
+		opts.upgradeOpts = append(opts.upgradeOpts, upgrade.WithPreSymlinkCallback(preUpgradeCallback))
 	}
 }
 
@@ -873,7 +922,7 @@ func WithRollback(rollback bool) UpgradeOpt {
 
 // Upgrade runs the upgrade process.
 // Called from external goroutines.
-func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, opts ...UpgradeOpt) error {
+func (c *Coordinator) Upgrade(ctx context.Context, version string, sources []string, action *fleetapi.ActionUpgrade, opts ...UpgradeOpt) error {
 	var uOpts upgradeOpts
 	for _, opt := range opts {
 		opt(&uOpts)
@@ -938,23 +987,15 @@ func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI str
 
 	// early check capabilities to ensure this upgrade actions is allowed
 	if c.caps != nil {
-		if !c.caps.AllowUpgrade(version, sourceURI) {
+		if !c.caps.AllowUpgrade(version, sources) {
 			c.ClearOverrideState()
 			det.Fail(ErrNotUpgradable)
 			return ErrNotUpgradable
 		}
+		sources = c.caps.FilterUpgradeSources(version, sources)
 	}
 
-	// run any pre upgrade callback
-	if uOpts.preUpgradeCallback != nil {
-		if err := uOpts.preUpgradeCallback(ctx, c.logger, action); err != nil {
-			c.ClearOverrideState()
-			det.Fail(err)
-			return err
-		}
-	}
-
-	cb, err := c.upgradeMgr.Upgrade(ctx, version, uOpts.rollback, sourceURI, action, det, uOpts.skipVerifyOverride, uOpts.skipDefaultPgp, uOpts.pgpBytes...)
+	cb, err := c.upgradeMgr.Upgrade(ctx, version, uOpts.rollback, sources, action, det, uOpts.skipVerifyOverride, uOpts.skipDefaultPgp, uOpts.pgpBytes, uOpts.upgradeOpts...)
 	if err != nil {
 		c.ClearOverrideState()
 		if errors.Is(err, upgrade.ErrUpgradeSameVersion) {
@@ -971,7 +1012,17 @@ func (c *Coordinator) Upgrade(ctx context.Context, version string, sourceURI str
 			err = upgradeErrors.ErrInsufficientDiskSpace
 		}
 
-		det.Fail(err)
+		// MarkUpgradeFailed updates det in-memory and, when an upgrade marker
+		// is present on disk (i.e. the failure happened after markUpgrade ran),
+		// persists state=Failed so the watcher started on next boot recognizes
+		// the upgrade as terminal and skips the grace-period watch instead of
+		// treating it as an in-progress upgrade. Returns an error only when a
+		// marker is present but cannot be loaded or written; absent markers are
+		// a no-op.
+		if mErr := upgrade.MarkUpgradeFailed(paths.Data(), det, err); mErr != nil {
+			c.logger.Warnw("failed to persist failed-state marker; reconcile deferred to next boot",
+				"error.message", mErr.Error())
+		}
 		return err
 	}
 
@@ -1001,6 +1052,9 @@ func (c *Coordinator) AckUpgrade(ctx context.Context, acker acker.Acker) error {
 // PerformAction executes an action on a unit.
 // Called from external goroutines.
 func (c *Coordinator) PerformAction(ctx context.Context, comp component.Component, unit component.Unit, name string, params map[string]interface{}) (map[string]interface{}, error) {
+	if comp.RuntimeManager == component.OtelRuntimeManager {
+		return c.otelMgr.PerformAction(ctx, comp, unit, name, params)
+	}
 	return c.runtimeMgr.PerformAction(ctx, comp, unit, name, params)
 }
 
@@ -1247,15 +1301,19 @@ func (c *Coordinator) DiagnosticHooks() diagnostics.Hooks {
 				}
 
 				output := struct {
-					Headers     map[string]string `yaml:"headers"`
-					LogLevel    string            `yaml:"log_level"`
-					RawLogLevel string            `yaml:"log_level_raw"`
-					Metadata    *info.ECSMeta     `yaml:"metadata"`
+					Headers          map[string]string `yaml:"headers"`
+					LogLevelRuntime  string            `yaml:"log_level"`
+					LogLevelPolicy   string            `yaml:"log_level_policy"`
+					LogLevelOverride string            `yaml:"log_level_override"`
+					Tags             []string          `yaml:"tags,omitempty"`
+					Metadata         *ecsmeta.ECSMeta  `yaml:"metadata"`
 				}{
-					Headers:     c.agentInfo.Headers(),
-					LogLevel:    c.agentInfo.LogLevel(),
-					RawLogLevel: c.agentInfo.RawLogLevel(),
-					Metadata:    meta,
+					Headers:          c.agentInfo.Headers(),
+					LogLevelRuntime:  c.agentInfo.GetLogLevelRuntime(),
+					LogLevelPolicy:   c.agentInfo.GetLogLevelPolicy(),
+					LogLevelOverride: c.agentInfo.GetLogLevelOverride(),
+					Tags:             c.State().Tags,
+					Metadata:         meta,
 				}
 				o, err := yaml.Marshal(output)
 				if err != nil {
@@ -1656,7 +1714,6 @@ func (c *Coordinator) runLoopIteration(ctx context.Context) {
 			err := c.refreshComponentModel(ctx)
 			if err != nil {
 				err = fmt.Errorf("error refreshing component model for PID update: %w", err)
-				c.setConfigManagerError(err)
 				c.logger.Errorf("%s", err)
 			}
 		}
@@ -1668,27 +1725,12 @@ func (c *Coordinator) runLoopIteration(ctx context.Context) {
 		c.applyComponentState(componentState)
 
 	case change := <-c.managerChans.configManagerUpdate:
-		if err := c.processConfig(ctx, change.Config()); err != nil {
-			c.logger.Errorf("applying new policy: %s", err.Error())
-			change.Fail(err)
-		} else {
-			if err := change.Ack(); err != nil {
-				err = fmt.Errorf("failed to ack configuration change: %w", err)
-				// Workaround: setConfigManagerError is usually used by the config
-				// manager to report failed ACKs / etc when communicating with Fleet.
-				// We need to report a failed ACK here, but the policy change has
-				// already been successfully applied so we don't want to report it as
-				// a general Coordinator or policy failure.
-				// This arises uniquely here because this is the only case where an
-				// action is responsible for reporting the failure of its own ACK
-				// call. The "correct" fix is to make this Ack() call unfailable
-				// and handle ACK retries and reporting in the config manager like
-				// with other action types -- this error would then end up invoking
-				// setConfigManagerError "organically" via the config manager's
-				// reporting channel. In the meantime, we do it manually.
-				c.setConfigManagerError(err)
-				c.logger.Errorf("%s", err.Error())
-			}
+		err := c.processConfigChange(ctx, change)
+		if err != nil {
+			c.logger.Errorf("%s", err)
+		}
+		if c.isManaged {
+			c.setConfigManagerActionsError(err)
 		}
 
 	case vars := <-c.managerChans.varsManagerUpdate:
@@ -1726,20 +1768,25 @@ func (c *Coordinator) runLoopIteration(ctx context.Context) {
 }
 
 // Always called on the main Coordinator goroutine.
-func (c *Coordinator) processConfig(ctx context.Context, cfg *config.Config) (err error) {
+func (c *Coordinator) processConfigChange(ctx context.Context, change ConfigChange) (err error) {
 	c.migrationProgressWg.Wait()
 
-	// processConfigAgent will apply persisted config and set c.otelCfg before calling refreshComponentModel
-	err = c.processConfigAgent(ctx, cfg)
+	// processConfig will apply persisted config and set c.otelCfg before calling refreshComponentModel
+	err = c.processConfig(ctx, change.Config())
 	if err != nil {
-		return err
+		change.Fail(err)
+		return fmt.Errorf("failed to apply new policy change: %w", err)
+	}
+
+	if err := change.Ack(); err != nil {
+		return fmt.Errorf("failed to ack new policy change: %w", err)
 	}
 
 	return nil
 }
 
 // Always called on the main Coordinator goroutine.
-func (c *Coordinator) processConfigAgent(ctx context.Context, cfg *config.Config) (err error) {
+func (c *Coordinator) processConfig(ctx context.Context, cfg *config.Config) (err error) {
 	span, ctx := apm.StartSpan(ctx, "config", "app.internal")
 	defer func() {
 		apm.CaptureError(ctx, err).Send()
@@ -1799,8 +1846,8 @@ func (c *Coordinator) processConfigAgent(ctx context.Context, cfg *config.Config
 	}
 	c.currentCfg = currentCfg
 
-	// check if log level has changed for standalone elastic-agent
-	// we'd have to update both the periodic and once config watchers and refactor initialization in application.go to do otherwise.
+	// Standalone mode has no dedicated notification channel unlike managed mode,
+	// so the log level is read from the policy config on each reload.
 	if c.agentInfo.IsStandalone() {
 		ll := currentCfg.Settings.LoggingConfig.Level
 		if ll != c.state.LogLevel {
@@ -1810,6 +1857,13 @@ func (c *Coordinator) processConfigAgent(ctx context.Context, cfg *config.Config
 			logger.SetLevel(ll)
 			c.logger.Infof("log level changed to %s", ll.String())
 		}
+	}
+
+	// Both modes read tags from the policy config so no dedicated notification channel is needed.
+	tags := info.NormalizeTags(currentCfg.Settings.Tags)
+	if !slices.Equal(tags, c.state.Tags) {
+		c.setTags(tags)
+		c.logger.Infof("tags changed to %v", tags)
 	}
 
 	return c.refreshComponentModel(ctx)
@@ -1862,6 +1916,7 @@ func (c *Coordinator) generateAST(cfg *config.Config, m map[string]interface{}) 
 	}
 
 	c.ast = rawAst
+	c.renderCache.Reset()
 	return nil
 }
 
@@ -1925,17 +1980,67 @@ func (c *Coordinator) observeASTVars(ctx context.Context) error {
 	return nil
 }
 
-// getDynamicInputs returns the set of dynamic inputs based on a map from input id to the dynamic provider used.
-// Currently, this simply checks if the provider really is dynamic, but this may become more complex in the future.
+// getDynamicInputs returns the set of dynamic inputs based on the information recorded while
+// rendering the inputs.
+//
+// An input is dynamic when it was rendered from a dynamic variable provider and it resolved at
+// least one variable owned by that provider which isn't listed in staticVariables. If no provider
+// variables were recorded for an input we can't tell whether it is static, so it stays flagged
+// as dynamic.
 // Returns a map of input ID to bool.
-func getDynamicInputs(inputToDynamicProvider map[string]string) map[string]bool {
+func getDynamicInputs(
+	log *logger.Logger,
+	renderedInputs map[string]transpiler.RenderedInputInfo,
+	staticVariables []string,
+) map[string]bool {
 	dynamicInputs := make(map[string]bool)
-	for inputId, dynamicProvider := range inputToDynamicProvider {
-		if composable.IsDynamic(dynamicProvider) {
-			dynamicInputs[inputId] = true
+	for inputId, info := range renderedInputs {
+		if !composable.IsDynamic(info.DynamicProvider) {
+			continue
 		}
+		// keep inputs without recorded variables flagged as dynamic
+		isDynamic := len(info.ProviderVars) == 0
+		for _, name := range info.ProviderVars {
+			if !isStaticVariable(staticVariables, name) {
+				isDynamic = true
+				break
+			}
+		}
+		if !isDynamic {
+			log.Debugf(
+				"Input %s is not treated as dynamic, all %s provider variables it uses (%v) are configured as static",
+				inputId, info.DynamicProvider, info.ProviderVars,
+			)
+			continue
+		}
+		dynamicInputs[inputId] = true
 	}
 	return dynamicInputs
+}
+
+// isStaticVariable reports whether the variable name is covered by one of the configured static
+// variables, either by an exact match or as a '.'-separated path prefix. For example
+// `kubernetes.node` covers `kubernetes.node.name` but not `kubernetes.nodename`.
+func isStaticVariable(staticVariables []string, name string) bool {
+	for _, static := range staticVariables {
+		if name == static || strings.HasPrefix(name, static+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// renderedInputsForLog turns the variable introspection results into a value suitable for
+// structured logging.
+func renderedInputsForLog(renderedInputs map[string]transpiler.RenderedInputInfo) map[string]any {
+	loggable := make(map[string]any, len(renderedInputs))
+	for inputId, info := range renderedInputs {
+		loggable[inputId] = map[string]any{
+			"dynamic_provider": info.DynamicProvider,
+			"provider_vars":    info.ProviderVars,
+		}
+	}
+	return loggable
 }
 
 // processVars updates the transpiler vars in the Coordinator.
@@ -1968,6 +2073,11 @@ func (c *Coordinator) refreshComponentModel(ctx context.Context) (err error) {
 		// Nothing to process yet
 		return nil
 	}
+
+	defer func() {
+		// Update componentModelErr with the results.
+		c.setComponentModelError(err)
+	}()
 
 	span, ctx := apm.StartSpan(ctx, "refreshComponentModel", "app.internal")
 	defer func() {
@@ -2002,9 +2112,14 @@ func (c *Coordinator) refreshComponentModel(ctx context.Context) (err error) {
 		Components: c.componentModel,
 		Signed:     signed,
 	}
+	c.state.PolicyConfiguredActionTypes = policyConfiguredActionTypes(c.componentModel)
+	c.state.PolicyApplied = true
 
 	c.logger.Info("Updating running component model")
-	c.logger.With("components", model.Components).Debug("Updating running component model")
+	if c.logger.IsDebug() {
+		// With encodes the components eagerly, so only pay for it when it can be logged
+		c.logger.With("components", model.Components).Debug("Updating running component model")
+	}
 	c.updateManagersWithConfig(model)
 	return nil
 }
@@ -2135,7 +2250,7 @@ func (c *Coordinator) applyOTelUpdate(components []component.Component) {
 	if len(ids) > 0 {
 		c.logger.With("component_ids", ids).Info("Using OpenTelemetry collector runtime.")
 	}
-	c.otelMgr.Update(c.otelCfg, c.currentCfg.Settings, c.state.LogLevel, components)
+	c.otelMgr.Update(c.otelCfg, c.currentCfg.Settings.MonitoringConfig, c.state.LogLevel, components)
 }
 
 // forceApplyPendingTransitions applies all deferred updates regardless of
@@ -2241,8 +2356,8 @@ func maybeOverrideRuntimeForComponent(logger *logger.Logger, runtimeCfg *compone
 
 		// check if the component is dynamic and use the right runtime
 		// dynamic components can cause problems for the otel collector because of its expensive configuration reloading
-		dynamicRuntimeManager := component.RuntimeManager(runtimeCfg.DynamicInputs)
-		if runtimeCfg.DynamicInputs != "" && comp.Dynamic && comp.RuntimeManager != dynamicRuntimeManager {
+		dynamicRuntimeManager := runtimeCfg.DynamicInputs.RuntimeManagerForDynamicInput(comp.BeatName(), comp.InputType)
+		if dynamicRuntimeManager != "" && comp.Dynamic && comp.RuntimeManager != dynamicRuntimeManager {
 			logger.Warnf("Component %s uses dynamic variable providers, switching to %s runtime", comp.ID, dynamicRuntimeManager)
 			comp.RuntimeManager = dynamicRuntimeManager
 		}
@@ -2285,23 +2400,21 @@ func (c *Coordinator) ackMigration(ctx context.Context, action *fleetapi.ActionM
 // Called from both the main Coordinator goroutine and from external
 // goroutines via diagnostics hooks.
 func (c *Coordinator) generateComponentModel() (err error) {
-	defer func() {
-		// Update componentGenErr with the results.
-		c.setComponentGenError(err)
-	}()
-
 	ast := c.ast.ShallowClone()
 
 	// perform variable substitution for inputs
 	inputs, ok := transpiler.Lookup(ast, "inputs")
-	var inputToDynamicProvider map[string]string
+	var renderedInputInfo map[string]transpiler.RenderedInputInfo
+	var renderedInputs *transpiler.RenderedInputs
 	if ok {
-		var renderedInputs transpiler.Node
-		renderedInputs, inputToDynamicProvider, err = transpiler.RenderInputs(inputs, c.vars)
+		renderedInputs, err = transpiler.RenderInputsCached(inputs, c.vars, c.renderCache)
 		if err != nil {
 			return fmt.Errorf("rendering inputs failed: %w", err)
 		}
-		err = transpiler.Insert(ast, renderedInputs, "inputs")
+		renderedInputInfo = renderedInputs.Info
+		// the rendered inputs are added to the map form of the policy below, straight from
+		// the render cache, instead of being converted from the tree on every refresh
+		err = transpiler.Insert(ast, transpiler.NewList(nil), "inputs")
 		if err != nil {
 			return fmt.Errorf("inserting rendered inputs failed: %w", err)
 		}
@@ -2325,6 +2438,9 @@ func (c *Coordinator) generateComponentModel() (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to convert ast to map[string]interface{}: %w", err)
 	}
+	if renderedInputs != nil {
+		cfg["inputs"] = renderedInputs.Maps()
+	}
 	var configInjector component.GenerateMonitoringCfgFn
 	if c.monitorMgr != nil && c.monitorMgr.Enabled() {
 		configInjector = c.monitorMgr.MonitoringConfig
@@ -2341,8 +2457,15 @@ func (c *Coordinator) generateComponentModel() (err error) {
 		}
 		return comps, nil
 	}
-	dynamicInputs := getDynamicInputs(inputToDynamicProvider)
-	c.logger.With("dynamic_inputs", dynamicInputs).Debugf("Dynamic inputs found")
+	dynamicInputs := getDynamicInputs(
+		c.logger, renderedInputInfo, c.currentCfg.Settings.Internal.Runtime.DynamicInputs.StaticVariables)
+	if c.logger.IsDebug() {
+		// building the introspection details isn't free, only do it when it can be logged
+		c.logger.With(
+			"dynamic_inputs", dynamicInputs,
+			"rendered_dynamic_inputs", renderedInputsForLog(renderedInputInfo),
+		).Debugf("Dynamic inputs found")
+	}
 	comps, err := c.specs.ToComponents(
 		cfg,
 		c.currentCfg.Settings.Internal.Runtime,
@@ -2352,6 +2475,7 @@ func (c *Coordinator) generateComponentModel() (err error) {
 		c.agentInfo,
 		existingCompState,
 		dynamicInputs,
+		component.WithExpectedConfigCache(c.expectedConfigCache),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to render components: %w", err)
@@ -2538,6 +2662,22 @@ func convertUnitListToMap(unitList []component.Unit) map[string]component.Unit {
 	return unitMap
 }
 
+// policyConfiguredActionTypes returns a map from action type to the IDs of components
+// in comps that handle it. Derived from the component spec rather than runtime state,
+// so it includes components that have not yet started.
+func policyConfiguredActionTypes(comps []component.Component) map[string][]string {
+	result := make(map[string][]string)
+	for _, comp := range comps {
+		if comp.InputSpec == nil {
+			continue
+		}
+		for _, typ := range comp.InputSpec.Spec.ProxiedActions {
+			result[typ] = append(result[typ], comp.ID)
+		}
+	}
+	return result
+}
+
 func convertComponentListToMap(compList []component.Component) map[string]component.Component {
 	compMap := map[string]component.Component{}
 	for _, c := range compList {
@@ -2557,7 +2697,7 @@ func diffUnitList(old, new []component.Unit) map[string]diffCheck {
 		if oldUnit, ok := oldMap[id]; ok {
 			diff.inLast = true
 			if newUnits.Config != nil && oldUnit.Config != nil && newUnits.Config.GetSource() != nil && oldUnit.Config.GetSource() != nil {
-				diff.updated = !reflect.DeepEqual(newUnits.Config.GetSource().AsMap(), oldUnit.Config.GetSource().AsMap())
+				diff.updated = !gproto.Equal(newUnits.Config.GetSource(), oldUnit.Config.GetSource())
 			}
 			delete(oldMap, id)
 		}
@@ -2691,9 +2831,9 @@ func logBasedOnState(l *logger.Logger, state client.UnitState, msg string, args 
 }
 
 func (c *Coordinator) unenroll(ctx context.Context, client fleetapiClient.Sender) error {
-	unenrollCmd := fleetapi.NewAuditUnenrollCmd(c.agentInfo, client)
-	unenrollReq := &fleetapi.AuditUnenrollRequest{
-		Reason:    fleetapi.ReasonMigration,
+	unenrollCmd := internalfleetapi.NewAuditUnenrollCmd(c.agentInfo, client)
+	unenrollReq := &internalfleetapi.AuditUnenrollRequest{
+		Reason:    internalfleetapi.ReasonMigration,
 		Timestamp: time.Now().UTC(),
 	}
 	unenrollResp, err := unenrollCmd.Execute(ctx, unenrollReq)

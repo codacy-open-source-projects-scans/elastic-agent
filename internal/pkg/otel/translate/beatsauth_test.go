@@ -27,7 +27,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
-	"go.opentelemetry.io/collector/confmap/xconfmap"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/extension"
@@ -96,6 +95,7 @@ func TestMTLS(t *testing.T) {
 			"certificate":             clientCertificate,
 			"key":                     clientKey,
 		},
+		"queue": map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 	}
 
 	// translate beat to beatreceiver config
@@ -159,6 +159,7 @@ func TestKeyPassPhrase(t *testing.T) {
 			"key":                     clientKey,
 			"key_passphrase":          "your-password",
 		},
+		"queue": map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 	}
 
 	// translate beat to beatreceiver config
@@ -216,6 +217,7 @@ func TestCATrustedFingerPrint(t *testing.T) {
 		"ssl": map[string]any{
 			"ca_trusted_fingerprint": fingerprint,
 		},
+		"queue": map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 	}
 
 	// translate beat to beatreceiver config
@@ -386,6 +388,7 @@ func TestVerificationMode(t *testing.T) {
 					"certificate_authorities": []any{caFilePath(t)},
 					"verification_mode":       test.verificationMode,
 				},
+				"queue": map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 			}
 
 			// translate beat to beatreceiver config
@@ -470,6 +473,7 @@ func TestProxyHTTP(t *testing.T) {
 					"type":      "elasticsearch",
 					"hosts":     []any{servername},
 					"proxy_url": proxy_url,
+					"queue":     map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 				}
 			},
 			expectProxiedRequests: true,
@@ -505,6 +509,7 @@ func TestProxyHTTP(t *testing.T) {
 					"ssl": map[string]any{
 						"certificate_authorities": caFilePath(t),
 					},
+					"queue": map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 				}
 			},
 			expectProxiedRequests: true,
@@ -520,6 +525,7 @@ func TestProxyHTTP(t *testing.T) {
 					"hosts":         []any{servername},
 					"proxy_url":     proxy_url,
 					"proxy_disable": true,
+					"queue":         map[string]any{"mem": map[string]any{"flush": map[string]any{"min_events": 1}}},
 				}
 			},
 
@@ -615,7 +621,7 @@ func newTestESExporter(t *testing.T, exporterCfg map[string]any) (ESexporter exp
 	require.NoError(t, esConf.Unmarshal(cfg), "error unmarshalling user config into ES config")
 
 	// validate the config
-	require.NoError(t, xconfmap.Validate(cfg))
+	require.NoError(t, confmap.Validate(cfg))
 
 	settings := exportertest.NewNopSettings(component.MustNewType(esExporterName))
 

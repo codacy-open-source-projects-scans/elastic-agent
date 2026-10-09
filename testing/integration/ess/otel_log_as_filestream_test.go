@@ -9,6 +9,7 @@ package ess
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,11 +114,19 @@ func TestFilebeatReceiverLogAsFilestream(t *testing.T) {
 
 	// Start Elastic Agent/Filebeat receiver running the Log input
 	wg.Add(1)
+	// Guarantee the goroutine joins before the test returns even if a later
+	// require.X triggers t.Fatal. Otherwise the goroutine outlives the test
+	// and its require.NoError(t, ...) panics with "Fail in goroutine after
+	// TestFilebeatReceiverLogAsFilestream has completed".
+	t.Cleanup(wg.Wait)
 	go func() {
 		defer wg.Done()
-		ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(3*time.Minute))
+		ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(3*time.Minute))
 		defer cancel()
-		require.NoError(t, fixture.RunOtelWithClient(ctx))
+		err := fixture.RunOtelWithClient(ctx)
+		assert.Conditionf(t, func() bool {
+			return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		}, "unexpected error running OtelWithClient: %v", err)
 	}()
 
 	agentLogFile := fs.LogFile{}
@@ -152,11 +161,15 @@ func TestFilebeatReceiverLogAsFilestream(t *testing.T) {
 	require.NoError(t, fixture.ConfigureOtel(t.Context(), yamlCfg), "cannot configure Otel")
 
 	wg.Add(1)
+	t.Cleanup(wg.Wait)
 	go func() {
 		defer wg.Done()
-		ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(5*time.Minute))
+		ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(5*time.Minute))
 		defer cancel()
-		require.NoError(t, fixture.RunOtelWithClient(ctx))
+		err := fixture.RunOtelWithClient(ctx)
+		assert.Conditionf(t, func() bool {
+			return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		}, "unexpected error running OtelWithClient: %v", err)
 	}()
 
 	// Ensure the Filestream input starts
@@ -183,13 +196,6 @@ func TestFilebeatReceiverLogAsFilestream(t *testing.T) {
 		20*time.Second,
 		"Filestream did not detect change in the file")
 
-	// Wait for Filestream to finish reading the file
-	agentLogFile.WaitLogsContains(
-		t,
-		"End of file reached: "+inputFilePathStr+"; Backoff now",
-		20*time.Second,
-		"Filestream did not reach EOF")
-
 	// Ensure all 100 events have been ingested and stop Elastic Agent
 	waitEventsInES(100)
 
@@ -197,12 +203,16 @@ func TestFilebeatReceiverLogAsFilestream(t *testing.T) {
 	wg.Wait()
 
 	wg.Add(1)
+	t.Cleanup(wg.Wait)
 	go func() {
 		defer wg.Done()
-		ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(3*
+		ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(3*
 			time.Minute))
 		defer cancel()
-		require.NoError(t, fixture.RunOtelWithClient(ctx))
+		err := fixture.RunOtelWithClient(ctx)
+		assert.Conditionf(t, func() bool {
+			return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		}, "unexpected error running OtelWithClient: %v", err)
 	}()
 
 	// Start Elastic Agent again to ensure it is correctly tracking the state

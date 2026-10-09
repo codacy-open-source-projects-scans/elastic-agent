@@ -66,6 +66,10 @@ func (p *StatefulProvisioner) Name() string {
 	return ProvisionerStateful
 }
 
+func (p *StatefulProvisioner) Location() common.ProvisionerLocation {
+	return common.ProvisionerLocationRemote
+}
+
 func (p *StatefulProvisioner) SetLogger(l common.Logger) {
 	p.logger = l
 	p.client.SetLogger(l)
@@ -225,10 +229,11 @@ func (p *StatefulProvisioner) createDeployment(ctx context.Context, r common.Sta
 	}
 
 	createDeploymentRequest := CreateDeploymentRequest{
-		Name:    name,
-		Region:  p.cfg.Region,
-		Version: r.Version,
-		Tags:    tagArray,
+		Name:           name,
+		Region:         p.cfg.Region,
+		Version:        r.Version,
+		Tags:           tagArray,
+		KibanaMemoryMB: r.KibanaMemoryMB,
 	}
 
 	resp, err := p.client.CreateDeployment(ctx, createDeploymentRequest)

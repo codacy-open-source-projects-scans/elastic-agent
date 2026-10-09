@@ -6,6 +6,7 @@ package upgrade
 
 import (
 	goerrors "errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,11 +14,11 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/ttl"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/pkg/version"
 )
 
@@ -48,6 +49,8 @@ type UpdateMarker struct {
 
 	Details *details.Details `json:"details,omitempty" yaml:"details,omitempty"`
 
+	// Agents older than 9.5.0 read rollback targets from this field on Windows.
+	// TODO: remove once the minimum supported upgrade-from version is 9.5.0.
 	RollbacksAvailable map[string]ttl.TTLMarker `json:"rollbacks_available,omitempty" yaml:"rollbacks_available,omitempty"`
 }
 
@@ -62,21 +65,29 @@ func (um UpdateMarker) GetActionID() string {
 
 // MarkerActionUpgrade adapter struct compatible with pre 8.3 version of the marker file format
 type MarkerActionUpgrade struct {
-	ActionID   string `yaml:"id"`
-	ActionType string `yaml:"type"`
-	Version    string `yaml:"version"`
-	SourceURI  string `yaml:"source_uri,omitempty"`
+	ActionID   string   `yaml:"id"`
+	ActionType string   `yaml:"type"`
+	Version    string   `yaml:"version"`
+	SourceURI  string   `yaml:"source_uri,omitempty"` // backward compatibility
+	Sources    []string `yaml:"sources,omitempty"`
 }
 
 func convertToMarkerAction(a *fleetapi.ActionUpgrade) *MarkerActionUpgrade {
 	if a == nil {
 		return nil
 	}
+
+	sourceURI := ""
+	if len(a.Data.Sources) > 0 {
+		sourceURI = a.Data.Sources[0]
+	}
+
 	return &MarkerActionUpgrade{
 		ActionID:   a.ActionID,
 		ActionType: a.ActionType,
 		Version:    a.Data.Version,
-		SourceURI:  a.Data.SourceURI,
+		SourceURI:  sourceURI,
+		Sources:    a.Data.Sources,
 	}
 }
 
@@ -84,12 +95,18 @@ func convertToActionUpgrade(a *MarkerActionUpgrade) *fleetapi.ActionUpgrade {
 	if a == nil {
 		return nil
 	}
+
+	sources := a.Sources
+	if len(sources) == 0 && a.SourceURI != "" {
+		sources = []string{a.SourceURI}
+	}
+
 	return &fleetapi.ActionUpgrade{
 		ActionID:   a.ActionID,
 		ActionType: a.ActionType,
 		Data: fleetapi.ActionUpgradeData{
-			Version:   a.Version,
-			SourceURI: a.SourceURI,
+			Version: a.Version,
+			Sources: sources,
 		},
 	}
 }
@@ -133,10 +150,10 @@ type agentInstall struct {
 
 type updateActiveCommitFunc func(log *logger.Logger, topDirPath, hash string, writeFile writeFileFunc) error
 
-// markUpgrade marks update happened so we can handle grace period
-func markUpgradeProvider(updateActiveCommit updateActiveCommitFunc, writeFile writeFileFunc) markUpgradeFunc {
+// writeUpgradeMarkerProvider returns a function that writes the upgrade marker file.
+// It does not update active.commit; use it to protect the target directory before unpacking starts.
+func writeUpgradeMarkerProvider() writeUpgradeMarkerFunc {
 	return func(log *logger.Logger, dataDirPath string, updatedOn time.Time, agent, previousAgent agentInstall, action *fleetapi.ActionUpgrade, upgradeDetails *details.Details, availableRollbacks map[string]ttl.TTLMarker) error {
-
 		if len(previousAgent.hash) > HashLen {
 			previousAgent.hash = previousAgent.hash[:HashLen]
 		}
@@ -161,15 +178,23 @@ func markUpgradeProvider(updateActiveCommit updateActiveCommitFunc, writeFile wr
 
 		markerPath := markerFilePath(dataDirPath)
 		log.Infow("Writing upgrade marker file", "file.path", markerPath, "hash", marker.Hash, "prev_hash", marker.PrevHash)
-		if err := writeFile(markerPath, markerBytes, 0600); err != nil {
+		if err := writeMarkerFile(markerPath, markerBytes, true); err != nil {
 			return goerrors.Join(err, errors.New(errors.TypeFilesystem, "failed to create update marker file", errors.M(errors.MetaKeyPath, markerPath)))
 		}
 
-		if err := updateActiveCommit(log, paths.Top(), agent.hash, writeFile); err != nil {
+		return nil
+	}
+}
+
+// markUpgradeProvider returns a function that writes the upgrade marker file and updates active.commit.
+// Use it after the symlink has been flipped to the new binary.
+func markUpgradeProvider(updateActiveCommit updateActiveCommitFunc, writeFile writeFileFunc) markUpgradeFunc {
+	writeMarker := writeUpgradeMarkerProvider()
+	return func(log *logger.Logger, dataDirPath string, updatedOn time.Time, agent, previousAgent agentInstall, action *fleetapi.ActionUpgrade, upgradeDetails *details.Details, availableRollbacks map[string]ttl.TTLMarker) error {
+		if err := writeMarker(log, dataDirPath, updatedOn, agent, previousAgent, action, upgradeDetails, availableRollbacks); err != nil {
 			return err
 		}
-
-		return nil
+		return updateActiveCommit(log, paths.Top(), agent.hash, writeFile)
 	}
 }
 
@@ -184,11 +209,48 @@ func UpdateActiveCommit(log *logger.Logger, topDirPath, hash string, writeFile w
 	return nil
 }
 
+// MarkUpgradeFailed records an upgrade failure both in the in-memory
+// upgrade-details (det.Fail(cause)) and, if a marker is on disk, by saving
+// the marker with state=Failed so the failure is surfaced to Fleet via the
+// next upgrade-details ack.
+//
+// Designed as the single entry point for marking an upgrade as failed across
+// every error path that can run after the upgrade flow has begun, regardless
+// of whether the marker file was ever written. det is always mutated; the
+// marker step is best-effort and a no-op when no marker exists (e.g.
+// markUpgrade failed before writing it, or the failure happened before the
+// marker was created), so callers can invoke it uniformly without first
+// checking marker presence.
+//
+// The on-disk part is what prevents the next agent run from starting a
+// watcher against an upgrade that has already been undone
+// (https://github.com/elastic/elastic-agent/issues/13505).
+func MarkUpgradeFailed(dataDirPath string, det *details.Details, cause error) error {
+	det.Fail(cause)
+	marker, err := LoadMarker(dataDirPath)
+	if err != nil {
+		return errors.New(err, errors.TypeFilesystem, "loading marker after upgrade failure")
+	}
+	if marker == nil {
+		return nil
+	}
+	marker.Details = det
+	if err := SaveMarker(dataDirPath, marker, true); err != nil {
+		return errors.New(err, errors.TypeFilesystem, "saving failed-state marker")
+	}
+	return nil
+}
+
 // CleanMarker removes a marker from disk.
 func CleanMarker(log *logger.Logger, dataDirPath string) error {
 	markerFile := markerFilePath(dataDirPath)
 	log.Infow("Removing marker file", "file.path", markerFile)
-	if err := os.Remove(markerFile); !os.IsNotExist(err) {
+	// The leading err != nil guard is load-bearing — errors.Is(nil, fs.ErrNotExist)
+	// returns false, so dropping the guard would cause the success case
+	// (err == nil) to also enter the return branch. Currently harmless
+	// because there's no work after this block, but brittle to future
+	// additions; keep the guard.
+	if err := os.Remove(markerFile); err != nil && !goerrors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
@@ -199,6 +261,30 @@ func CleanMarker(log *logger.Logger, dataDirPath string) error {
 // and no error.
 func LoadMarker(dataDirPath string) (*UpdateMarker, error) {
 	return loadMarker(markerFilePath(dataDirPath))
+}
+
+// TryLoadMarker loads the upgrade marker. If the file does not exist it
+// returns nil and no error. Unlike LoadMarker, if the file exists but cannot be
+// parsed (e.g. corrupted by a crash during an upgrade write), it renames the
+// corrupt file and returns nil so startup can proceed without upgrade state.
+func TryLoadMarker(log *logger.Logger, dataDirPath string) (*UpdateMarker, error) {
+	markerFile := markerFilePath(dataDirPath)
+	marker, err := loadMarker(markerFile)
+	if err == nil {
+		return marker, nil
+	}
+
+	// The file exists but could not be parsed. Move it aside so the agent can
+	// start without upgrade state rather than aborting startup entirely.
+	corruptPath := markerFile + ".corrupt"
+	if renameErr := os.Rename(markerFile, corruptPath); renameErr != nil {
+		log.Warnf("corrupt upgrade marker at %s could not be moved to %s (parse error: %v, rename error: %v); starting without upgrade state",
+			markerFile, corruptPath, err, renameErr)
+	} else {
+		log.Warnf("corrupt upgrade marker moved to %s (parse error: %v); starting without upgrade state",
+			corruptPath, err)
+	}
+	return nil, nil
 }
 
 func loadMarker(markerFile string) (*UpdateMarker, error) {

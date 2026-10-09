@@ -53,6 +53,7 @@ import (
 	"github.com/elastic/elastic-agent/pkg/core/process"
 	"github.com/elastic/elastic-agent/pkg/utils"
 	"github.com/elastic/elastic-agent/version"
+	"github.com/elastic/go-ucfg"
 )
 
 const (
@@ -149,6 +150,7 @@ be used when the same credentials will be used across all the possible actions a
   KIBANA_FLEET_PASSWORD - Kibana password to enable Fleet [$ELASTICSEARCH_PASSWORD]
   KIBANA_CA - path to certificate authority to use with communicate with Kibana [$ELASTICSEARCH_CA]
   ELASTIC_AGENT_TAGS - user provided tags for the agent [linux,staging]
+  ELASTIC_AGENT_HOSTNAME - override the hostname reported by Elastic Agent and supported supervised Beat workloads (Cloudbeat unaffected)
 
 * Beats Receivers
   The following experimental environment variables can be set to enable using Beats Receivers.
@@ -165,7 +167,7 @@ all the above actions will be skipped, because the Elastic Agent has already bee
 occurs on every start of the container set FLEET_FORCE to 1.
 `,
 		Run: func(c *cobra.Command, args []string) {
-			if err := logContainerCmd(streams); err != nil {
+			if err := logContainerCmd(streams); err != nil && !errors.Is(err, context.Canceled) {
 				logError(streams, err)
 				os.Exit(1)
 			}
@@ -367,7 +369,7 @@ func runContainerCmd(streams *cli.IOStreams, cfg setupConfig) error {
 		monitoringServer = nil
 	}
 
-	return run(containerCfgOverrides, false, initTimeout, isContainer)
+	return run(containerLoggingCfgOverrides, containerCfgOverrides, false, initTimeout, isContainer)
 }
 
 // TokenResp is used to decode a response for generating a service token
@@ -875,38 +877,60 @@ func runLegacyAPMServer(streams *cli.IOStreams) (*process.Info, error) {
 	return process.Start(spec.BinaryPath, options...)
 }
 
-func containerCfgOverrides(cfg *configuration.Configuration) {
-	logsPath := envWithDefault("", "LOGS_PATH")
-	if logsPath == "" {
-		// when no LOGS_PATH defined the container should log to stderr
-		cfg.Settings.LoggingConfig.ToStderr = true
-		cfg.Settings.LoggingConfig.ToFiles = false
-	}
+// containerLoggingCfgOverrides applies container logging defaults before Fleet values can override them.
+func containerLoggingCfgOverrides(cfg *config.Config) error {
+	uCfg := map[string]any{}
 
-	if envBool("HTTPPROF") {
-		// sanity checks to ensure monitoring config is setup
-		if cfg.Settings.MonitoringConfig == nil {
-			cfg.Settings.MonitoringConfig = monitoringCfg.DefaultConfig()
-		}
-
-		if cfg.Settings.MonitoringConfig.Pprof == nil {
-			cfg.Settings.MonitoringConfig.Pprof = &monitoringCfg.PprofConfig{}
-		}
-
-		cfg.Settings.MonitoringConfig.Pprof.Enabled = true
+	if logsPath := envWithDefault("", "LOGS_PATH"); logsPath == "" {
+		uCfg["agent.logging.to_stderr"] = true
+		uCfg["agent.logging.to_files"] = false
 	}
 
 	eventsToStderrEnv := envWithDefault("false", "EVENTS_TO_STDERR")
 	eventsToStderr, err := strconv.ParseBool(eventsToStderrEnv)
 	if err != nil {
-		logp.Warn("cannot parse EVENS_TO_STDERR='%s' as boolean, logging events to file'", eventsToStderrEnv)
+		logp.Warn("cannot parse EVENTS_TO_STDERR='%s' as boolean, logging events to file", eventsToStderrEnv)
 	}
 	if eventsToStderr {
-		cfg.Settings.EventLoggingConfig.ToFiles = false
-		cfg.Settings.EventLoggingConfig.ToStderr = true
+		uCfg["agent.logging.event_data.to_files"] = false
+		uCfg["agent.logging.event_data.to_stderr"] = true
 	}
 
-	configuration.OverrideDefaultContainerGRPCPort(cfg.Settings.GRPC)
+	if err := cfg.Merge(uCfg); err != nil {
+		return err
+	}
+	return customLogsPathCfgOverride(cfg)
+}
+
+// containerCfgOverrides applies authoritative container settings after Fleet values are merged.
+func containerCfgOverrides(cfg *config.Config) error {
+	uCfg := map[string]any{}
+
+	if envBool("HTTPPROF") {
+		uCfg["agent.monitoring.pprof.enabled"] = true
+	}
+
+	uCfg["agent.grpc.port"] = configuration.GetContainerGRPCPort()
+
+	// Always read certs from env.
+	uCfg["fleet.ssl.certificate"] = envWithDefault("", "ELASTIC_AGENT_CERT")
+	uCfg["fleet.ssl.key"] = envWithDefault("", "ELASTIC_AGENT_CERT_KEY")
+
+	for _, key := range []string{"FLEET_CA", "KIBANA_CA", "ELASTICSEARCH_CA"} {
+		// Override with first explicitly defined env var, even if value is empty
+		// ucfg Merge won't allow an empty array to overwrite, so we have to
+		// edit cfg instead of uCfg here
+		if caEnv, ok := os.LookupEnv(key); ok {
+			if caChild, err := ucfg.NewFrom(cli.StringToSlice(caEnv)); err != nil {
+				return fmt.Errorf("failed to create CA config for container override: %w", err)
+			} else if err := cfg.Agent.SetChild("fleet.ssl.certificate_authorities", -1, caChild, ucfg.PathSep(".")); err != nil {
+				return fmt.Errorf("failed to write CA config for container override: %w", err)
+			}
+			break
+		}
+	}
+
+	return cfg.Merge(uCfg)
 }
 
 func setPaths(statePath, configPath, logsPath, socketPath string, writePaths bool) error {
@@ -1178,6 +1202,27 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 		return false, fmt.Errorf("failed to read from disk store: %w", err)
 	}
 
+	err = cfg.Agent.SetString("fleet.ssl.certificate", -1, envWithDefault("", "ELASTIC_AGENT_CERT"), ucfg.PathSep("."))
+	if err != nil {
+		return false, fmt.Errorf("failed to override cert: %w", err)
+	}
+	err = cfg.Agent.SetString("fleet.ssl.key", -1, envWithDefault("", "ELASTIC_AGENT_CERT_KEY"), ucfg.PathSep("."))
+	if err != nil {
+		return false, fmt.Errorf("failed to override cert key: %w", err)
+	}
+
+	for _, key := range []string{"FLEET_CA", "KIBANA_CA", "ELASTICSEARCH_CA"} {
+		if caEnv, ok := os.LookupEnv(key); ok {
+			// Override with first explicitly defined env var, even if value is empty
+			if caChild, err := ucfg.NewFrom(cli.StringToSlice(caEnv)); err != nil {
+				return false, fmt.Errorf("failed to create CA config for container override: %w", err)
+			} else if err := cfg.Agent.SetChild("fleet.ssl.certificate_authorities", -1, caChild, ucfg.PathSep(".")); err != nil {
+				return false, fmt.Errorf("failed to write CA config for container override: %w", err)
+			}
+			break
+		}
+	}
+
 	storedConfig, err := configuration.NewFromConfig(cfg)
 	if err != nil {
 		return false, fmt.Errorf("failed to read from disk store: %w", err)
@@ -1195,6 +1240,14 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 		// No stored Fleet hosts, enrollment is required.
 		return true, nil
 	}
+	// When the agent bootstraps its own Fleet Server (FLEET_SERVER_ENABLE=1), enrollment
+	// does not use FLEET_URL. enrollCmd.prepareFleetTLS() rewrites the enrollment URL to
+	// the Fleet Server internal endpoint (https://localhost:8221 by default) and that is
+	// what ends up persisted in fleet.enc.
+	expectedFleetURL := setupCfg.Fleet.URL
+	if setupCfg.FleetServer.Enable {
+		expectedFleetURL = getBootstrapFleetServerURL(setupCfg.FleetServer)
+	}
 	// Parse the setup Fleet URL to extract the host portion for comparison.
 	// Stored hosts can be in one of two forms depending on when the config was last saved:
 	//  - Full URL "https://host:port" — after a fleet policy update (handler_action_policy_change
@@ -1202,9 +1255,9 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 	//  - Host-only "host:port" — right after enrollment, before the first policy update
 	//    (remote.NewConfigFromURL stores Protocol and Host as separate fields).
 	// We must match against both forms so that neither case triggers a spurious re-enrollment.
-	setupFleetURL, err := url.Parse(setupCfg.Fleet.URL)
+	setupFleetURL, err := url.Parse(expectedFleetURL)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse fleet URL %q: %w", setupCfg.Fleet.URL, err)
+		return false, fmt.Errorf("failed to parse fleet URL %q: %w", expectedFleetURL, err)
 	}
 	setupFleetHost := setupFleetURL.Host
 	if setupFleetHost == "" {
@@ -1212,12 +1265,12 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 		// or misinterpret "host:port" as scheme:opaque. Fall back to the raw URL
 		// for the host comparison, and skip the protocol check since there is no
 		// reliable scheme.
-		setupFleetHost = setupCfg.Fleet.URL
+		setupFleetHost = expectedFleetURL
 	}
 	// Check for a match against the full URL (post-policy-update form) or
 	// the host-only form (post-enrollment, pre-policy-update form).
 	// Track which form matched so we can decide whether to do the protocol check below.
-	matchedFullURL := slices.Contains(storedFleetHosts, setupCfg.Fleet.URL)
+	matchedFullURL := slices.Contains(storedFleetHosts, expectedFleetURL)
 	matchedHostOnly := slices.Contains(storedFleetHosts, setupFleetHost)
 	if !matchedFullURL && !matchedHostOnly {
 		// The Fleet URL in the setup does not exist in the stored configuration, so enrollment is required.
@@ -1297,6 +1350,16 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 	case errors.Is(err, fleetclient.ErrInvalidAPIKey):
 		// The API key is invalid, so enrollment is required.
 		return true, nil
+	case errors.IsNetworkError(err):
+		// Fleet Server could not be reached, so the API key could not be validated.
+		//
+		// This is expected when the agent runs its own Fleet Server: this check runs before
+		// Fleet Server is started, so nothing is listening on the internal endpoint yet.
+		// It is also possible when a remote Fleet Server is temporarily unavailable.
+		//
+		// Either way the stored credentials have not been proven invalid, so keep the
+		// existing enrollment instead of discarding it and creating a duplicate agent.
+		log.Warnf("failed to validate api token against Fleet Server, keeping existing enrollment: %v", err)
 	case err != nil:
 		return false, fmt.Errorf("failed to validate api token: %w", err)
 	}
@@ -1339,6 +1402,20 @@ func shouldFleetEnroll(setupCfg setupConfig) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// getBootstrapFleetServerURL returns the URL the agent uses to reach the Fleet Server it runs
+// itself, as derived from the container setup configuration.
+//
+// A bootstrapped Fleet Server exposes an internal endpoint on localhost:8221 in addition to
+// its external endpoint (0.0.0.0:8220 by default). enrollCmd.prepareFleetTLS() points
+// enrollment at that internal endpoint, so it is the URL that gets persisted in fleet.enc
+// and the one the agent keeps using afterwards. The container command does not expose the
+// internal port, so it is always the default one.
+func getBootstrapFleetServerURL(cfg fleetServerConfig) string {
+	// prepareFleetTLS only runs Fleet Server insecure when no certificate is given.
+	insecure := cfg.InsecureHTTP && cfg.Cert == "" && cfg.CertKey == ""
+	return fleetServerInternalURL(fleetServerInternalHostPort(defaultFleetServerInternalPort), insecure)
 }
 
 // ackFleet performs an ACK request to the fleet server with **empty events**.

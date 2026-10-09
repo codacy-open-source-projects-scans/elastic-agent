@@ -18,8 +18,10 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
+	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
+	"github.com/elastic/elastic-agent/internal/pkg/util"
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/core/process"
@@ -38,6 +40,22 @@ const (
 
 	stateUnknownMessage = "Unknown"
 )
+
+// Environment variables for agentless mode
+const (
+	isAgentlessEnvName          = "ELASTIC_AGENT_IS_AGENTLESS"
+	stateStoreInputTypesEnvName = "AGENTLESS_ELASTICSEARCH_STATE_STORE_INPUT_TYPES"
+)
+
+// hostnameOverrideArgs returns ["--hostname", h] when beatName is a standard
+// libbeat binary that supports the flag and h is non-empty, otherwise nil.
+// Cloudbeat is intentionally excluded from ELASTIC_AGENT_HOSTNAME propagation.
+func hostnameOverrideArgs(beatName, h string) []string {
+	if beatName == "" || beatName == "cloudbeat" || h == "" {
+		return nil
+	}
+	return []string{"--hostname", h}
+}
 
 func (m actionMode) String() string {
 	switch m {
@@ -206,40 +224,7 @@ func (c *commandRuntime) Run(ctx context.Context, comm Communicator) error {
 				c.sendObserved()
 			}
 		case checkin := <-comm.CheckinObserved():
-			sendExpected := false
-			changed := false
-			if c.state.State == client.UnitStateStarting {
-				// first observation after start set component to healthy
-				c.state.State = client.UnitStateHealthy
-				c.state.Message = fmt.Sprintf("Healthy: communicating with pid '%d'", c.proc.PID)
-				changed = true
-			}
-			if c.lastCheckin.IsZero() {
-				// first check-in
-				sendExpected = true
-			}
-			// Warning lastCheckin must contain a
-			// monotonic clock.  Functions like Local(),
-			// UTC(), Round(), AddDate(), etc. remove the
-			// monotonic clock.  See
-			// https://pkg.go.dev/time
-			c.lastCheckin = time.Now()
-			if c.state.syncCheckin(checkin) {
-				changed = true
-			}
-			if c.state.unsettled() {
-				sendExpected = true
-			}
-			if sendExpected {
-				checkinExpected := c.state.toCheckinExpected()
-				comm.CheckinExpected(checkinExpected, checkin)
-			}
-			if changed {
-				c.sendObserved()
-			}
-			if c.state.cleanupStopped() {
-				c.sendObserved()
-			}
+			c.processCheckin(checkin, comm)
 		case <-t.C:
 			t.Reset(checkinPeriod)
 			if c.actionState == actionStart {
@@ -370,18 +355,78 @@ func (c *commandRuntime) sendObserved() {
 	c.ch <- c.state.Copy()
 }
 
+// processCheckin handles an observed check-in message from the running process.
+func (c *commandRuntime) processCheckin(checkin *proto.CheckinObserved, comm Communicator) {
+	// Ignore late check-ins once the component is no longer meant to be
+	// running. The checkinObserved channel is unbuffered, so a final check-in
+	// emitted by a dying process can be parked on it while stop() blocks the
+	// Run() loop reaping the process, then delivered after stop() has already
+	// forced UnitStateStopped. Processing it would resurrect non-stopped unit
+	// states via syncCheckin and emit a state update after the terminal
+	// Stopped state, re-broadcasting stale health for a component that has
+	// been removed. This mirrors serviceRuntime's isRunning() guard in its
+	// own processCheckin.
+	if c.actionState != actionStart || c.state.State == client.UnitStateStopping || c.state.State == client.UnitStateStopped {
+		return
+	}
+	sendExpected := false
+	changed := false
+	if c.state.State == client.UnitStateStarting {
+		// first observation after start set component to healthy
+		c.state.State = client.UnitStateHealthy
+		c.state.Message = fmt.Sprintf("Healthy: communicating with pid '%d'", c.proc.PID)
+		changed = true
+	}
+	if c.lastCheckin.IsZero() {
+		// first check-in
+		sendExpected = true
+	}
+	// Warning lastCheckin must contain a
+	// monotonic clock.  Functions like Local(),
+	// UTC(), Round(), AddDate(), etc. remove the
+	// monotonic clock.  See
+	// https://pkg.go.dev/time
+	c.lastCheckin = time.Now()
+	if c.state.syncCheckin(checkin) {
+		changed = true
+	}
+	if c.state.unsettled() {
+		sendExpected = true
+	}
+	if sendExpected {
+		checkinExpected := c.state.toCheckinExpected()
+		comm.CheckinExpected(checkinExpected, checkin)
+	}
+	if changed {
+		c.sendObserved()
+	}
+	if c.state.cleanupStopped() {
+		c.sendObserved()
+	}
+}
+
 func (c *commandRuntime) start(comm Communicator) error {
 	if c.proc != nil {
 		// already running
 		return nil
 	}
 	cmdSpec := c.getCommandSpec()
-	env := make([]string, 0, len(cmdSpec.Env)+2)
+	env := make([]string, 0, len(cmdSpec.Env)+4)
 	for _, e := range cmdSpec.Env {
 		env = append(env, fmt.Sprintf("%s=%s", e.Name, e.Value))
 	}
 	env = append(env, fmt.Sprintf("%s=%s", envAgentComponentID, c.current.ID))
 	env = append(env, fmt.Sprintf("%s=%s", envAgentComponentType, c.getSpecType()))
+
+	// in case of agentless mode, propagate the agentless environment variables
+	if v, ok := os.LookupEnv(isAgentlessEnvName); ok {
+		env = append(env, fmt.Sprintf("%s=%s", isAgentlessEnvName, v))
+	}
+
+	if v, ok := os.LookupEnv(stateStoreInputTypesEnvName); ok {
+		env = append(env, fmt.Sprintf("%s=%s", stateStoreInputTypesEnvName, v))
+	}
+
 	workDir := c.current.WorkDirPath(paths.Run())
 	path, err := filepath.Abs(c.getSpecBinaryPath())
 	if err != nil {
@@ -399,6 +444,8 @@ func (c *commandRuntime) start(comm Communicator) error {
 
 	// differentiate data paths
 	args = append(args, "-E", "path.data="+workDir)
+
+	args = append(args, hostnameOverrideArgs(c.current.BeatName(), util.HostnameOverride())...)
 
 	// reset checkin state before starting the process.
 	c.lastCheckin = time.Time{}

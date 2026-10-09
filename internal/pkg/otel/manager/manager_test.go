@@ -29,6 +29,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
+
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/logp/logptest"
 	"github.com/elastic/elastic-agent-libs/mapstr"
@@ -86,6 +87,36 @@ var (
 		},
 	}
 
+	testConfigDebugLogLevel = map[string]interface{}{
+		"receivers": map[string]interface{}{
+			"nop": map[string]interface{}{},
+		},
+		"processors": map[string]interface{}{
+			"batch": map[string]interface{}{},
+		},
+		"exporters": map[string]interface{}{
+			"nop": map[string]interface{}{},
+		},
+		"service": map[string]interface{}{
+			"telemetry": map[string]interface{}{
+				"metrics": map[string]interface{}{
+					"level":   "none",
+					"readers": []any{},
+				},
+				"logs": map[string]interface{}{
+					"level": "debug",
+				},
+			},
+			"pipelines": map[string]interface{}{
+				"logs": map[string]interface{}{
+					"receivers":  []string{"nop"},
+					"processors": []string{"batch"},
+					"exporters":  []string{"nop"},
+				},
+			},
+		},
+	}
+
 	testConfigNoLogLevel = map[string]interface{}{
 		"receivers": map[string]interface{}{
 			"nop": map[string]interface{}{},
@@ -133,7 +164,7 @@ func testExecutionFactory(testBinary string, inner ExecutionFactory) (ExecutionF
 		if inner != nil {
 			exec, err = inner(testBinary, healthCheckExtID, healthCheckPort)
 		} else {
-			exec, err = newSubprocessExecution(testBinary, healthCheckExtID, healthCheckPort)
+			exec, err = newSubprocessExecution(testBinary, healthCheckExtID, healthCheckPort, true)
 		}
 		if err != nil {
 			return nil, err
@@ -144,12 +175,12 @@ func testExecutionFactory(testBinary string, inner ExecutionFactory) (ExecutionF
 	return factory, te
 }
 
-func (e *testExecution) startCollector(ctx context.Context, level logp.Level, collectorLogger *logger.Logger, logger *logger.Logger, cfg *confmap.Conf, errCh chan error, statusCh chan *status.AggregateStatus, forceFetchStatusCh chan struct{}) (collectorHandle, error) {
+func (e *testExecution) startCollector(ctx context.Context, agentLogger, collectorLogger *logger.Logger, collectorLevel logp.Level, cfg *confmap.Conf, errCh chan error, statusCh chan *status.AggregateStatus, forceFetchStatusCh chan struct{}) (collectorHandle, error) {
 	e.mtx.Lock()
 	defer e.mtx.Unlock()
 
 	var err error
-	e.handle, err = e.exec.startCollector(ctx, level, collectorLogger, logger, cfg, errCh, statusCh, forceFetchStatusCh)
+	e.handle, err = e.exec.startCollector(ctx, agentLogger, collectorLogger, collectorLevel, cfg, errCh, statusCh, forceFetchStatusCh)
 	return e.handle, err
 }
 
@@ -173,9 +204,9 @@ type mockExecution struct {
 
 func (e *mockExecution) startCollector(
 	ctx context.Context,
-	level logp.Level,
 	_ *logger.Logger,
 	_ *logger.Logger,
+	collectorLevel logp.Level,
 	cfg *confmap.Conf,
 	errCh chan error,
 	statusCh chan *status.AggregateStatus,
@@ -195,7 +226,7 @@ func (e *mockExecution) startCollector(
 		stopCh:            stopCh,
 		cancel:            collectorCancel,
 		execution:         e,
-		collectorLogLevel: level,
+		collectorLogLevel: collectorLevel,
 	}
 	if e.collectorStarted != nil {
 		e.collectorStartCount++
@@ -442,10 +473,15 @@ func TestOTelManager_Run(t *testing.T) {
 				m.Update(cfg, nil, logp.InfoLevel, nil)
 				e.EnsureHealthy(t, updateTime)
 
-				// trigger update
+				// trigger update: switch the collector log level to debug.
 				updateTime = time.Now()
-				ok := cfg.Delete("service::telemetry::logs::level") // modify the config
-				require.True(t, ok)
+				require.NoError(t, cfg.Merge(confmap.NewFromStringMap(map[string]any{
+					"service": map[string]any{
+						"telemetry": map[string]any{
+							"logs": map[string]any{"level": "debug"},
+						},
+					},
+				})))
 				m.Update(cfg, nil, logp.InfoLevel, nil)
 				e.EnsureHealthy(t, updateTime)
 
@@ -596,7 +632,7 @@ func TestOTelManager_Run(t *testing.T) {
 			name: "subprocess collector killed if delayed and manager is stopped",
 			makeExecFactory: func(collectorRunErr chan error) ExecutionFactory {
 				return func(collectorPath, healthCheckExtID string, healthCheckPort int) (collectorExecution, error) {
-					exec, err := newSubprocessExecution(collectorPath, healthCheckExtID, healthCheckPort)
+					exec, err := newSubprocessExecution(collectorPath, healthCheckExtID, healthCheckPort, true)
 					if err != nil {
 						return nil, err
 					}
@@ -648,7 +684,7 @@ func TestOTelManager_Run(t *testing.T) {
 			name: "subprocess collector gracefully exited if delayed a bit and manager is stopped",
 			makeExecFactory: func(collectorRunErr chan error) ExecutionFactory {
 				return func(collectorPath, healthCheckExtID string, healthCheckPort int) (collectorExecution, error) {
-					exec, err := newSubprocessExecution(collectorPath, healthCheckExtID, healthCheckPort)
+					exec, err := newSubprocessExecution(collectorPath, healthCheckExtID, healthCheckPort, true)
 					if err != nil {
 						return nil, err
 					}
@@ -833,7 +869,7 @@ func TestOTelManager_Run(t *testing.T) {
 			}
 			factory, testExec := testExecutionFactory(testBinary, innerFactory)
 
-			m, err := NewOTelManager(l, logp.InfoLevel, base, &info.AgentInfo{}, nil, nil, waitTimeForStop, factory)
+			m, err := NewOTelManager(l, logp.InfoLevel, base, &info.AgentInfo{}, nil, waitTimeForStop, factory, true)
 			require.NoError(t, err, "could not create otel manager")
 			m.recoveryTimer = tc.restarter
 			if tc.makeExecFactory != nil {
@@ -893,55 +929,291 @@ func TestOTelManager_Logging(t *testing.T) {
 	defer cancel()
 	const waitTimeForStop = 30 * time.Second
 
+	tmp := t.TempDir()
+	topPath, logsPath := paths.Top(), paths.Logs()
+	paths.SetTop(tmp)
+	paths.SetLogs(filepath.Join(tmp, "logs"))
+	t.Cleanup(func() {
+		paths.SetTop(topPath)
+		paths.SetLogs(logsPath)
+	})
+
+	l, _ := loggertest.New("otel-manager")
+
+	t.Setenv("TEST_SUPERVISED_COLLECTOR_EMIT_EVENT_LOG", "1")
+
+	factory, _ := testExecutionFactory(testBinary, nil)
+
+	collectorLogger, err := logger.NewNamedLogger(CollectorLogFileName, logger.DefaultLoggingConfig(), logger.DefaultEventLoggingConfig())
+	require.NoError(t, err, "could not create collector logger")
+
+	m, err := NewOTelManager(l, logp.InfoLevel, collectorLogger, &info.AgentInfo{}, nil, waitTimeForStop, factory, true)
+	require.NoError(t, err, "could not create otel manager")
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		err := m.Run(ctx)
+		assert.ErrorIs(t, err, context.Canceled, "otel manager should be cancelled")
+	})
+
+	// watch is synchronous, so we need to read from it to avoid blocking the manager
+	wg.Go(func() {
+		for {
+			select {
+			case <-m.WatchCollector():
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+
+	cfg := confmap.NewFromStringMap(testConfigDebugLogLevel)
+	m.Update(cfg, nil, logp.InfoLevel, nil)
+
+	// Normal collector logs must appear in the dedicated log file, not in the agent's own log.
+	logFileGlob := filepath.Join(paths.Home(), "logs", CollectorLogFileName+"-*.ndjson")
+	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
+		matches, globErr := filepath.Glob(logFileGlob)
+		require.NoError(collect, globErr)
+		require.NotEmpty(collect, matches, "collector log file should exist at %s", logFileGlob)
+
+		data, readErr := os.ReadFile(matches[0])
+		require.NoError(collect, readErr)
+		assert.Contains(collect, string(data), "Internal metrics telemetry disabled",
+			"expected log message not found in collector log file")
+		assert.NotContains(collect, string(data), `"log.type":"event"`,
+			"event line should not leak into the collector's normal log file")
+	}, time.Second*10, time.Second)
+
+	// Event-tagged lines must be routed to the collector's own events log file.
+	eventLogFileGlob := filepath.Join(paths.Home(), "logs", "events", CollectorLogFileName+"-event-log-*.ndjson")
+	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
+		matches, globErr := filepath.Glob(eventLogFileGlob)
+		require.NoError(collect, globErr)
+		require.NotEmpty(collect, matches, "collector event log file should exist at %s", eventLogFileGlob)
+
+		data, readErr := os.ReadFile(matches[0])
+		require.NoError(collect, readErr)
+		assert.Contains(collect, string(data), "Publish event: test event log",
+			"event line should be routed to the collector's events log file")
+	}, time.Second*10, time.Second)
+
+	cancel()
+	wg.Wait()
+}
+
+// TestOTelManager_PartialReceiverReload drives the real supervised collector
+// subprocess through the manager and verifies that adding a receiver to an
+// existing pipeline results in a partial receiver reload (feature gates
+// service.partialReload / service.partialReloadReceivers, passed by
+// newSubprocessExecution) rather than a full service restart.
+func TestOTelManager_PartialReceiverReload(t *testing.T) {
+	wd, erWd := os.Getwd()
+	require.NoError(t, erWd, "cannot get working directory")
+
+	testBinary := filepath.Join(wd, "..", "..", "..", "..", "internal", "edot", "testing", "testing")
+	require.FileExists(t, testBinary, "testing binary not found")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const waitTimeForStop = 30 * time.Second
+
 	base, obs := loggertest.New("otel")
 	l, _ := loggertest.New("otel-manager")
 
-	for _, tc := range []struct {
-		name string
-	}{
-		{
-			name: "subprocess execution",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			factory, _ := testExecutionFactory(testBinary, nil)
-			m, err := NewOTelManager(l, logp.InfoLevel, base, &info.AgentInfo{}, nil, nil, waitTimeForStop, factory)
-			require.NoError(t, err, "could not create otel manager")
+	factory, _ := testExecutionFactory(testBinary, nil)
+	m, err := NewOTelManager(l, logp.InfoLevel, base, &info.AgentInfo{}, nil, waitTimeForStop, factory, true)
+	require.NoError(t, err, "could not create otel manager")
 
-			go func() {
-				err := m.Run(ctx)
-				assert.ErrorIs(t, err, context.Canceled, "otel manager should be cancelled")
-			}()
+	go func() {
+		err := m.Run(ctx)
+		assert.ErrorIs(t, err, context.Canceled, "otel manager should be cancelled")
+	}()
+	go func() {
+		for {
+			select {
+			case <-m.WatchCollector():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-			// watch is synchronous, so we need to read from it to avoid blocking the manager
-			go func() {
-				for {
-					select {
-					case <-m.WatchCollector():
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-
-			cfg := confmap.NewFromStringMap(testConfig)
-			m.Update(cfg, nil, logp.InfoLevel, nil)
-
-			// the collector should log to the base logger
-			assert.EventuallyWithT(t, func(collect *assert.CollectT) {
-				logs := obs.All()
-				require.NotEmpty(collect, logs, "Logs should not be empty")
-				found := false
-				for _, entry := range logs {
-					if entry.Message == "Internal metrics telemetry disabled" {
-						found = true
-						break
-					}
-				}
-				assert.True(collect, found, "Expected log message 'Internal metrics telemetry disabled' not found in logs")
-			}, time.Second*10, time.Second)
-		})
+	countMsg := func(msg string) int {
+		n := 0
+		for _, entry := range obs.All() {
+			if strings.Contains(entry.Message, msg) {
+				n++
+			}
+		}
+		return n
 	}
+
+	// initial config: single nop receiver feeding a logs pipeline.
+	initialCfg := map[string]interface{}{
+		"receivers":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"processors": map[string]interface{}{"batch": map[string]interface{}{}},
+		"exporters":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"service": map[string]interface{}{
+			"telemetry": map[string]interface{}{
+				"metrics": map[string]interface{}{"level": "none", "readers": []any{}},
+			},
+			"pipelines": map[string]interface{}{
+				"logs": map[string]interface{}{
+					"receivers":  []string{"nop"},
+					"processors": []string{"batch"},
+					"exporters":  []string{"nop"},
+				},
+			},
+		},
+	}
+	m.Update(confmap.NewFromStringMap(initialCfg), nil, logp.InfoLevel, nil)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Positive(collect, countMsg("Everything is ready. Begin running and processing data"),
+			"collector did not start")
+	}, 30*time.Second, 500*time.Millisecond)
+
+	// updated config: add a second nop receiver to the same logs pipeline. This is
+	// a receiver-only change, so the collector should reload only the receivers.
+	updatedCfg := map[string]interface{}{
+		"receivers": map[string]interface{}{
+			"nop":   map[string]interface{}{},
+			"nop/2": map[string]interface{}{},
+		},
+		"processors": map[string]interface{}{"batch": map[string]interface{}{}},
+		"exporters":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"service": map[string]interface{}{
+			"telemetry": map[string]interface{}{
+				"metrics": map[string]interface{}{"level": "none", "readers": []any{}},
+			},
+			"pipelines": map[string]interface{}{
+				"logs": map[string]interface{}{
+					"receivers":  []string{"nop", "nop/2"},
+					"processors": []string{"batch"},
+					"exporters":  []string{"nop"},
+				},
+			},
+		},
+	}
+	restartsBefore := countMsg("Config updated, restart service")
+	m.Update(confmap.NewFromStringMap(updatedCfg), nil, logp.InfoLevel, nil)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Positive(collect, countMsg("Config updated, performing partial receiver reload"),
+			"collector did not perform a partial receiver reload after a receiver-only change")
+	}, 30*time.Second, 500*time.Millisecond)
+
+	assert.Equal(t, restartsBefore, countMsg("Config updated, restart service"),
+		"collector performed a full service restart instead of a partial receiver reload")
+}
+
+// TestOTelManager_FullReloadWhenPartialReloadDisabled verifies that when partial
+// reload is disabled, a receiver-only config change triggers a full service
+// restart rather than a partial receiver reload.
+func TestOTelManager_FullReloadWhenPartialReloadDisabled(t *testing.T) {
+	wd, erWd := os.Getwd()
+	require.NoError(t, erWd, "cannot get working directory")
+
+	testBinary := filepath.Join(wd, "..", "..", "..", "..", "internal", "edot", "testing", "testing")
+	require.FileExists(t, testBinary, "testing binary not found")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const waitTimeForStop = 30 * time.Second
+
+	base, obs := loggertest.New("otel")
+	l, _ := loggertest.New("otel-manager")
+
+	// Use an inner factory that explicitly disables partial reload.
+	innerFactory := func(collectorPath, healthCheckExtID string, healthCheckPort int) (collectorExecution, error) {
+		return newSubprocessExecution(collectorPath, healthCheckExtID, healthCheckPort, false)
+	}
+	factory, _ := testExecutionFactory(testBinary, innerFactory)
+	m, err := NewOTelManager(l, logp.InfoLevel, base, &info.AgentInfo{}, nil, waitTimeForStop, factory, false)
+	require.NoError(t, err, "could not create otel manager")
+
+	go func() {
+		err := m.Run(ctx)
+		assert.ErrorIs(t, err, context.Canceled, "otel manager should be cancelled")
+	}()
+	go func() {
+		for {
+			select {
+			case <-m.WatchCollector():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	countMsg := func(msg string) int {
+		n := 0
+		for _, entry := range obs.All() {
+			if strings.Contains(entry.Message, msg) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// initial config: single nop receiver feeding a logs pipeline.
+	initialCfg := map[string]interface{}{
+		"receivers":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"processors": map[string]interface{}{"batch": map[string]interface{}{}},
+		"exporters":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"service": map[string]interface{}{
+			"telemetry": map[string]interface{}{
+				"metrics": map[string]interface{}{"level": "none", "readers": []any{}},
+			},
+			"pipelines": map[string]interface{}{
+				"logs": map[string]interface{}{
+					"receivers":  []string{"nop"},
+					"processors": []string{"batch"},
+					"exporters":  []string{"nop"},
+				},
+			},
+		},
+	}
+	m.Update(confmap.NewFromStringMap(initialCfg), nil, logp.InfoLevel, nil)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Positive(collect, countMsg("Everything is ready. Begin running and processing data"),
+			"collector did not start")
+	}, 30*time.Second, 500*time.Millisecond)
+
+	// updated config: add a second nop receiver to the same logs pipeline.
+	// With partial reload disabled this must trigger a full service restart.
+	updatedCfg := map[string]interface{}{
+		"receivers": map[string]interface{}{
+			"nop":   map[string]interface{}{},
+			"nop/2": map[string]interface{}{},
+		},
+		"processors": map[string]interface{}{"batch": map[string]interface{}{}},
+		"exporters":  map[string]interface{}{"nop": map[string]interface{}{}},
+		"service": map[string]interface{}{
+			"telemetry": map[string]interface{}{
+				"metrics": map[string]interface{}{"level": "none", "readers": []any{}},
+			},
+			"pipelines": map[string]interface{}{
+				"logs": map[string]interface{}{
+					"receivers":  []string{"nop", "nop/2"},
+					"processors": []string{"batch"},
+					"exporters":  []string{"nop"},
+				},
+			},
+		},
+	}
+	restartsBeforeUpdate := countMsg("Config updated, restart service")
+	m.Update(confmap.NewFromStringMap(updatedCfg), nil, logp.InfoLevel, nil)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Greater(collect, countMsg("Config updated, restart service"), restartsBeforeUpdate,
+			"collector did not perform a full service restart after config change with partial reload disabled")
+	}, 30*time.Second, 500*time.Millisecond)
+
+	assert.Equal(t, 0, countMsg("Config updated, performing partial receiver reload"),
+		"collector performed a partial receiver reload even though partial reload was disabled")
 }
 
 func TestOTelManager_Ports(t *testing.T) {
@@ -994,9 +1266,9 @@ func TestOTelManager_Ports(t *testing.T) {
 				base,
 				&info.AgentInfo{},
 				&agentCollectorConfig,
-				nil,
 				waitTimeForStop,
 				factory,
+				true,
 			)
 			require.NoError(t, err, "could not create otel manager")
 
@@ -1114,9 +1386,9 @@ func TestOTelManager_PortConflict(t *testing.T) {
 		base,
 		&info.AgentInfo{},
 		nil,
-		nil,
 		waitTimeForStop,
 		factory,
+		true,
 	)
 	require.NoError(t, err, "could not create otel manager")
 
@@ -1194,11 +1466,6 @@ func toSerializableStatus(s *status.AggregateStatus) *serializableStatus {
 	return outputStruct
 }
 
-// Mock function for BeatMonitoringConfigGetter
-func mockBeatMonitoringConfigGetter(unitID, binary string) map[string]any {
-	return map[string]any{"test": "config"}
-}
-
 // Helper function to create test logger
 func newTestLogger() *logger.Logger {
 	l, _ := loggertest.New("test")
@@ -1208,12 +1475,11 @@ func newTestLogger() *logger.Logger {
 func TestOTelManager_buildMergedConfig(t *testing.T) {
 	// Common parameters used across all test cases
 	var (
-		commonAgentInfo                  = &info.AgentInfo{}
-		commonBeatMonitoringConfigGetter = mockBeatMonitoringConfigGetter
-		testComp                         = testComponent("test-component")
-		invalidLogpLevel                 = logp.DebugLevel - 1
-		testOtelConfigLevel              = logp.InfoLevel
-		configUpdateLevel                = logp.WarnLevel
+		commonAgentInfo     = &info.AgentInfo{}
+		testComp            = testComponent("test-component")
+		invalidLogpLevel    = logp.DebugLevel - 1
+		testOtelConfigLevel = logp.InfoLevel
+		configUpdateLevel   = logp.WarnLevel
 	)
 
 	tests := []struct {
@@ -1266,6 +1532,17 @@ func TestOTelManager_buildMergedConfig(t *testing.T) {
 			expectedLogLevel: configUpdateLevel,
 		},
 		{
+			name:         "unit log level overrides agent log level",
+			collectorCfg: nil,
+			components: func() []component.Component {
+				c := testComponent("debug-comp")
+				c.Units[0].LogLevel = client.UnitLogLevelDebug
+				return []component.Component{c}
+			}(),
+			expectedKeys:     []string{"receivers", "exporters", "service"},
+			expectedLogLevel: logp.DebugLevel,
+		},
+		{
 			name:         "component config generation error",
 			collectorCfg: nil,
 			components: []component.Component{{
@@ -1290,7 +1567,7 @@ func TestOTelManager_buildMergedConfig(t *testing.T) {
 				healthCheckExtComponentID: "healthcheckv2/test-uuid",
 				collectorMetricsPort:      8888,
 			}
-			result, err := mgr.buildMergedConfig(cfgUpdate, commonAgentInfo, commonBeatMonitoringConfigGetter, logptest.NewTestingLogger(t, ""))
+			result, err := mgr.buildMergedConfig(cfgUpdate, commonAgentInfo, logptest.NewTestingLogger(t, ""))
 
 			if tt.expectedErrorString != "" {
 				assert.Error(t, err)
@@ -1340,7 +1617,6 @@ func TestBuildMergedConfigPreservesComponentExtensions(t *testing.T) {
 	}
 
 	agentInfo := &info.AgentInfo{}
-	monitoringGetter := translate.BeatMonitoringConfigGetter(func(_, _ string) map[string]any { return nil })
 
 	// Component with elasticsearch output: translate.GetOtelConfig always
 	// generates a beatsauth extension for elasticsearch outputs.
@@ -1419,7 +1695,7 @@ func TestBuildMergedConfigPreservesComponentExtensions(t *testing.T) {
 		components:   []component.Component{comp},
 	}
 
-	result, err := m.buildMergedConfig(cfgUpdate, agentInfo, monitoringGetter, logp.NewNopLogger())
+	result, err := m.buildMergedConfig(cfgUpdate, agentInfo, logp.NewNopLogger())
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
@@ -1476,7 +1752,7 @@ func TestBuildMergedConfigCollectorOnlyExtensions(t *testing.T) {
 		// No components: componentOtelCfg will be nil.
 	}
 
-	result, err := m.buildMergedConfig(cfgUpdate, &info.AgentInfo{}, nil, logp.NewNopLogger())
+	result, err := m.buildMergedConfig(cfgUpdate, &info.AgentInfo{}, logp.NewNopLogger())
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
@@ -1509,7 +1785,10 @@ func TestOTelManager_handleOtelStatusUpdate(t *testing.T) {
 					"pipeline:logs/_agent-component/test-component": {
 						Event: componentstatus.NewEvent(componentstatus.StatusOK),
 						ComponentStatusMap: map[string]*status.AggregateStatus{
-							"receiver:filebeat/_agent-component/test-component": {
+							"receiver:filebeat/_agent-component/test-component/test-1": {
+								Event: componentstatus.NewEvent(componentstatus.StatusOK),
+							},
+							"receiver:filebeat/_agent-component/test-component/test-2": {
 								Event: componentstatus.NewEvent(componentstatus.StatusOK),
 							},
 							"exporter:elasticsearch/_agent-component/test-component": {
@@ -1534,6 +1813,9 @@ func TestOTelManager_handleOtelStatusUpdate(t *testing.T) {
 								Event: componentstatus.NewEvent(componentstatus.StatusOK),
 							},
 							"extension:kafkapartitioner/test": {
+								Event: componentstatus.NewEvent(componentstatus.StatusOK),
+							},
+							"extension:oauth2client/test": {
 								Event: componentstatus.NewEvent(componentstatus.StatusOK),
 							},
 						},
@@ -1745,7 +2027,6 @@ func TestOTelManagerEndToEnd(t *testing.T) {
 	// Setup test logger and dependencies
 	testLogger, _ := loggertest.New("test")
 	agentInfo := &info.AgentInfo{}
-	beatMonitoringConfigGetter := mockBeatMonitoringConfigGetter
 	collectorStarted := make(chan struct{})
 	configUpdated := make(chan struct{}, 1) // buffered to avoid deadlocks in the mock execution
 
@@ -1764,9 +2045,9 @@ func TestOTelManagerEndToEnd(t *testing.T) {
 		testLogger,
 		agentInfo,
 		nil,
-		beatMonitoringConfigGetter,
 		time.Second,
 		mockFactory,
+		true,
 	)
 	require.NoError(t, err)
 	mgr.recoveryTimer = newRestarterNoop()
@@ -1847,7 +2128,7 @@ func TestOTelManagerEndToEnd(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, receivers)
 		assert.True(t, receivers.IsSet("nop"))
-		assert.True(t, receivers.IsSet("filebeatreceiver/_agent-component/test"))
+		assert.True(t, receivers.IsSet("filebeatreceiver/_agent-component/test/test-1"))
 	})
 
 	t.Run("empty collector config leaves the component config running", func(t *testing.T) {
@@ -1863,7 +2144,7 @@ func TestOTelManagerEndToEnd(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, receivers)
 		assert.False(t, receivers.IsSet("nop"))
-		assert.True(t, receivers.IsSet("filebeatreceiver/_agent-component/test"))
+		assert.True(t, receivers.IsSet("filebeatreceiver/_agent-component/test/test-1"))
 	})
 
 	t.Run("collector status with components is passed up to the component manager", func(t *testing.T) {
@@ -1874,7 +2155,10 @@ func TestOTelManagerEndToEnd(t *testing.T) {
 				"pipeline:logs/_agent-component/test": {
 					Event: componentstatus.NewEvent(componentstatus.StatusOK),
 					ComponentStatusMap: map[string]*status.AggregateStatus{
-						"receiver:filebeatreceiver/_agent-component/test": {
+						"receiver:filebeatreceiver/_agent-component/test/test-1": {
+							Event: componentstatus.NewEvent(componentstatus.StatusOK),
+						},
+						"receiver:filebeatreceiver/_agent-component/test/test-2": {
 							Event: componentstatus.NewEvent(componentstatus.StatusOK),
 						},
 						"exporter:elasticsearch/_agent-component/test": {
@@ -1964,7 +2248,7 @@ func TestOTelManager_RestartOnLogLevelChange(t *testing.T) {
 	mockFactory := func(string, string, int) (collectorExecution, error) {
 		return execution, nil
 	}
-	mgr, err := NewOTelManager(testLogger, logp.InfoLevel, testLogger, &info.AgentInfo{}, nil, nil, time.Second, mockFactory)
+	mgr, err := NewOTelManager(testLogger, logp.InfoLevel, testLogger, &info.AgentInfo{}, nil, time.Second, mockFactory, true)
 	require.NoError(t, err)
 	mgr.recoveryTimer = newRestarterNoop()
 
@@ -2029,9 +2313,9 @@ func TestOTelManager_CollectorRunErrWithNilConfig(t *testing.T) {
 		collectorLogger,
 		&info.AgentInfo{},
 		nil,
-		nil,
 		time.Second,
 		mockFactory,
+		true,
 	)
 	require.NoError(t, err)
 	mgr.recoveryTimer = newRestarterNoop()
@@ -2070,7 +2354,6 @@ func TestOTelManager_CollectorRunErrWithNilConfig(t *testing.T) {
 func TestManagerAlwaysEmitsStoppedStatesForComponents(t *testing.T) {
 	// Setup test logger and dependencies
 	testLogger, _ := loggertest.New("test")
-	beatMonitoringConfigGetter := mockBeatMonitoringConfigGetter
 	collectorStarted := make(chan struct{})
 
 	execution := &mockExecution{
@@ -2087,9 +2370,9 @@ func TestManagerAlwaysEmitsStoppedStatesForComponents(t *testing.T) {
 		testLogger,
 		&info.AgentInfo{},
 		nil,
-		beatMonitoringConfigGetter,
 		time.Second,
 		mockFactory,
+		true,
 	)
 	require.NoError(t, err)
 	mgr.recoveryTimer = newRestarterNoop()
@@ -2112,7 +2395,10 @@ func TestManagerAlwaysEmitsStoppedStatesForComponents(t *testing.T) {
 			"pipeline:logs/_agent-component/test": {
 				Event: componentstatus.NewEvent(componentstatus.StatusOK),
 				ComponentStatusMap: map[string]*status.AggregateStatus{
-					"receiver:filebeatreceiver/_agent-component/test": {
+					"receiver:filebeatreceiver/_agent-component/test/test-1": {
+						Event: componentstatus.NewEvent(componentstatus.StatusOK),
+					},
+					"receiver:filebeatreceiver/_agent-component/test/test-2": {
 						Event: componentstatus.NewEvent(componentstatus.StatusOK),
 					},
 					"exporter:elasticsearch/_agent-component/test": {
@@ -2169,7 +2455,6 @@ func TestManagerAlwaysEmitsStoppedStatesForComponents(t *testing.T) {
 func TestManagerEmitsStartingStatesWhenHealthcheckIsUnavailable(t *testing.T) {
 	testLogger, _ := loggertest.New("test")
 	agentInfo := &info.AgentInfo{}
-	beatMonitoringConfigGetter := mockBeatMonitoringConfigGetter
 	collectorStarted := make(chan struct{})
 
 	execution := &mockExecution{
@@ -2186,9 +2471,9 @@ func TestManagerEmitsStartingStatesWhenHealthcheckIsUnavailable(t *testing.T) {
 		testLogger,
 		agentInfo,
 		nil,
-		beatMonitoringConfigGetter,
 		time.Second,
 		mockFactory,
+		true,
 	)
 	require.NoError(t, err)
 	mgr.recoveryTimer = newRestarterNoop()
@@ -2452,10 +2737,9 @@ func TestAddCollectorMetricsPort(t *testing.T) {
 		"pull": map[string]any{
 			"exporter": map[string]any{
 				"prometheus": map[string]any{
-					"host":                "localhost",
-					"port":                0,
-					"without_units":       true,
-					"without_type_suffix": true,
+					"host":               "localhost",
+					"port":               0,
+					"without_scope_info": false,
 				},
 			},
 		},
@@ -2529,8 +2813,10 @@ func TestAddCollectorMetricsPort(t *testing.T) {
 
 func TestMonitoringReceiverProcessors(t *testing.T) {
 	exporterName := "elasticsearch/" + translate.OtelNamePrefix + "monitoring"
-	procName := translate.GetProcessorID().String()
-	pipelineName := "logs/" + translate.OtelNamePrefix + "internal-telemetry-monitoring"
+	procName := translate.GetProcessorID("internal-telemetry-monitoring").String()
+	// Processors are injected on the logs pipeline (connector → ES), which is only
+	// created when an OTel-based monitoring exporter is present.
+	logsPipelineName := "logs/" + translate.OtelNamePrefix + "internal-telemetry-monitoring"
 	baseConfig := map[string]any{
 		"exporters": map[string]any{
 			exporterName: nil,
@@ -2540,11 +2826,11 @@ func TestMonitoringReceiverProcessors(t *testing.T) {
 	monitoringConfig := &config.MonitoringConfig{}
 	agentInfo := &info.AgentInfo{}
 	components := []component.Component{}
-	err := injectMonitoringReceiver(cfg, monitoringConfig, agentInfo, components)
+	err := injectMonitoringReceiver(cfg, monitoringConfig, agentInfo, components, logp.NewNopLogger())
 	require.NoError(t, err, "injectMonitoringReceiver should succeed")
 	result := mapstr.M(cfg.ToStringMap()).Flatten()
 
-	expectedBeatsProcessors := translate.GetDefaultProcessors()
+	expectedBeatsProcessors := translate.GetDefaultProcessors("")
 	actualBeatsProcessors := result["processors."+procName+".processors"]
 	assert.NotNil(t, actualBeatsProcessors, "monitoring receiver processors should not be nil")
 	if actualBeatsProcessors != nil {
@@ -2552,9 +2838,105 @@ func TestMonitoringReceiverProcessors(t *testing.T) {
 	}
 
 	expectedPipelineProcessors := []string{procName}
-	actualPipelineProcessors := result["service.pipelines."+pipelineName+".processors"]
-	assert.NotNil(t, actualPipelineProcessors, "processors for monitoring receiver pipeline should not be nil")
-	assert.ElementsMatch(t, expectedPipelineProcessors, actualPipelineProcessors, "monitoring receiver pipeline processors should match default")
+	actualPipelineProcessors := result["service.pipelines."+logsPipelineName+".processors"]
+	assert.NotNil(t, actualPipelineProcessors, "processors for monitoring logs pipeline should not be nil")
+	assert.ElementsMatch(t, expectedPipelineProcessors, actualPipelineProcessors, "monitoring logs pipeline processors should match default")
+}
+
+func TestMonitoringReceiverFileExporter(t *testing.T) {
+	receiverName := "internal-telemetry-monitoring"
+	// The file exporter is on the metrics pipeline, which always exists.
+	metricsPipelineName := "metrics/" + translate.OtelNamePrefix + receiverName
+	// The logs pipeline (connector → ES) only exists when ES monitoring is configured.
+	logsPipelineName := "logs/" + translate.OtelNamePrefix + receiverName
+	fileExporterName := "file/" + translate.OtelNamePrefix + receiverName
+	connectorName := elasticMonitoringConnectorName + "/" + translate.OtelNamePrefix + receiverName
+
+	t.Run("with OTel monitoring exporter", func(t *testing.T) {
+		// When an OTel-based monitoring exporter is present:
+		// - metrics pipeline: receiver → [file exporter, connector]
+		// - logs pipeline:    connector → ES monitoring exporter
+		exporterName := "elasticsearch/" + translate.OtelNamePrefix + "monitoring"
+		baseConfig := map[string]any{
+			"exporters": map[string]any{
+				exporterName: nil,
+			},
+		}
+		cfg := confmap.NewFromStringMap(baseConfig)
+		err := injectMonitoringReceiver(cfg, &config.MonitoringConfig{}, &info.AgentInfo{}, []component.Component{}, logp.NewNopLogger())
+		require.NoError(t, err, "injectMonitoringReceiver should succeed")
+		result := mapstr.M(cfg.ToStringMap()).Flatten()
+
+		// Metrics pipeline exports to file and to the connector.
+		metricsExporters := result["service.pipelines."+metricsPipelineName+".exporters"]
+		require.NotNil(t, metricsExporters, "metrics pipeline exporters should not be nil")
+		assert.ElementsMatch(t,
+			[]string{fileExporterName, connectorName},
+			metricsExporters,
+			"metrics pipeline should export to the file exporter and the connector",
+		)
+
+		// Logs pipeline (connector output) exports to ES.
+		logsExporters := result["service.pipelines."+logsPipelineName+".exporters"]
+		require.NotNil(t, logsExporters, "logs pipeline exporters should not be nil")
+		assert.ElementsMatch(t,
+			[]string{exporterName},
+			logsExporters,
+			"logs pipeline should export to the elasticsearch monitoring exporter",
+		)
+	})
+
+	t.Run("without OTel monitoring exporter", func(t *testing.T) {
+		// When no OTel-based monitoring exporter exists (e.g. classic HTTP-based
+		// monitoring is in use), the metrics pipeline is still injected so that
+		// internal telemetry is captured in the diagnostics file. No connector or
+		// logs pipeline is added since there is no ES output to send logs to.
+		cfg := confmap.NewFromStringMap(map[string]any{})
+		err := injectMonitoringReceiver(cfg, &config.MonitoringConfig{}, &info.AgentInfo{}, []component.Component{}, logp.NewNopLogger())
+		require.NoError(t, err, "injectMonitoringReceiver should succeed without monitoring exporter")
+		result := mapstr.M(cfg.ToStringMap()).Flatten()
+
+		metricsExporters := result["service.pipelines."+metricsPipelineName+".exporters"]
+		require.NotNil(t, metricsExporters, "metrics pipeline should still be created with file-only exporters")
+		assert.ElementsMatch(t,
+			[]string{fileExporterName},
+			metricsExporters,
+			"metrics pipeline should export only to the diagnostics file exporter when no OTel monitoring exporter is present",
+		)
+
+		// No connector, no logs pipeline.
+		assert.Nil(t, result["connectors."+connectorName],
+			"connector should not be injected when no OTel monitoring exporter is present")
+		assert.Nil(t, result["service.pipelines."+logsPipelineName],
+			"logs pipeline should not be created when no OTel monitoring exporter is present")
+	})
+
+	t.Run("file exporter config", func(t *testing.T) {
+		cfg := confmap.NewFromStringMap(map[string]any{})
+		err := injectMonitoringReceiver(cfg, &config.MonitoringConfig{}, &info.AgentInfo{}, []component.Component{}, logp.NewNopLogger())
+		require.NoError(t, err, "injectMonitoringReceiver should succeed")
+		result := mapstr.M(cfg.ToStringMap()).Flatten()
+
+		// The file exporter path must be in paths.Home()/logs/ — the same directory
+		// that MakeInternalFileOutput writes to and that the diagnostics collector walks.
+		expectedPath := filepath.Join(paths.Home(), "logs", internalTelemetryDiagnosticsFileName)
+		assert.Equal(t, expectedPath, result["exporters."+fileExporterName+".path"],
+			"file exporter path should be in paths.Home()/logs/")
+
+		// Records are written as OTLP JSON metrics — format: json uses the same metrics
+		// marshaler as the otlp_encoding extension, without needing a separate extension component.
+		assert.Equal(t, "json", result["exporters."+fileExporterName+".format"])
+
+		// Rotation settings: 10 MB cap with one backup.
+		assert.Equal(t, defaultDiagnosticsFileSizeMB, result["exporters."+fileExporterName+".rotation.max_megabytes"])
+		assert.Equal(t, 1, result["exporters."+fileExporterName+".rotation.max_backups"])
+
+		// No on-disk compression: the diagnostics collector packages files into a zip using
+		// deflate, and repetitive JSON compresses to ~4% of its original size in that
+		// context — far better than the ~94% stored ratio of a pre-compressed zstd file.
+		assert.Nil(t, result["exporters."+fileExporterName+".compression"],
+			"compression should not be set; plain NDJSON deflates better inside the diagnostics zip")
+	})
 }
 
 // fakeCloseListener is a wrapper around a net.Listener that ignores the Close() method. This is used in a very particular

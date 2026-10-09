@@ -27,6 +27,7 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/core/logger/loggertest"
 
@@ -152,9 +153,9 @@ func TestResolveUninstallTokenArg(t *testing.T) {
 			uninstallSpec: &component.ServiceOperationsCommandSpec{
 				Args: []string{"uninstall", "--log", "stderr", "--uninstall-token"},
 			},
-			uninstallToken: "EQo1ML2T95pdcH",
+			uninstallToken: "placeholder",
 			wantUninstallSpec: &component.ServiceOperationsCommandSpec{
-				Args: []string{"uninstall", "--log", "stderr", "--uninstall-token", "EQo1ML2T95pdcH"},
+				Args: []string{"uninstall", "--log", "stderr", "--uninstall-token", "placeholder"},
 			},
 		},
 		{
@@ -166,9 +167,9 @@ func TestResolveUninstallTokenArg(t *testing.T) {
 					return args
 				}(),
 			},
-			uninstallToken: "EQo1ML2T95pdcH",
+			uninstallToken: "placeholder",
 			wantUninstallSpec: &component.ServiceOperationsCommandSpec{
-				Args: []string{"uninstall", "--log", "stderr", "--uninstall-token", "EQo1ML2T95pdcH"},
+				Args: []string{"uninstall", "--log", "stderr", "--uninstall-token", "placeholder"},
 			},
 		},
 	}
@@ -342,33 +343,40 @@ func TestCISKeepsRunningOnNonFatalExitCodeFromStart(t *testing.T) {
 	parsedCISAddr, err := url.Parse(cisAddr)
 	require.NoError(t, err)
 
+	// First, wait for the warning log message indicating the runtime continued
+	// past the non-fatal install failure. Filtering the observer (rather than
+	// draining it with TakeAll) means the assertion does not race with the
+	// connection-server dial below.
 	expectedWarnLogMsg := fmt.Sprintf("exit code %d is non-fatal, continuing to run...", nonFatalExitCode)
-	require.Eventually(t, func() bool {
+	require.Eventuallyf(t, func() bool {
+		return logObs.FilterLevelExact(zapcore.WarnLevel).FilterMessage(expectedWarnLogMsg).Len() > 0
+	}, 30*time.Second, 100*time.Millisecond, "did not observe expected non-fatal warn log %q", expectedWarnLogMsg)
+
+	// Then verify the connection-info server is still accepting connections.
+	// The dial is retried because on Windows winio's DialPipe can intermittently
+	// return ERROR_PIPE_BUSY between Accept calls; the conn is closed each
+	// attempt to avoid leaking client-side pipe handles.
+	require.Eventuallyf(t, func() bool {
+		var conn net.Conn
 		if runtime.GOOS != "windows" {
-			_, err = net.Dial("unix", parsedCISAddr.Host+parsedCISAddr.Path)
+			dialCtx, cancelDial := context.WithTimeout(ctx, time.Second)
+			conn, err = (&net.Dialer{}).DialContext(dialCtx, "unix", parsedCISAddr.Host+parsedCISAddr.Path)
+			cancelDial()
 		} else {
 			if strings.HasPrefix(cisAddr, "npipe:///") {
 				path := strings.TrimPrefix(cisAddr, "npipe:///")
 				cisAddr = `\\.\pipe\` + path
 			}
-			_, err = npipe.Dial(cisAddr)("", "")
+			conn, err = npipe.Dial(cisAddr)("", "")
 		}
 
 		if err != nil {
 			t.Logf("Connection info server is not running: %v", err)
 			return false
 		}
-
-		logs := logObs.TakeAll()
-		for _, l := range logs {
-			t.Logf("[%s] %s", l.Level, l.Message)
-			if l.Level == zapcore.WarnLevel && l.Message == expectedWarnLogMsg {
-				return true
-			}
-		}
-
-		return false
-	}, 30*time.Second, 1*time.Second)
+		_ = conn.Close()
+		return true
+	}, 30*time.Second, 1*time.Second, "connection info server did not accept a connection")
 }
 
 // TestServiceStartRetry tests that the service runtime will
@@ -447,6 +455,135 @@ func TestServiceStartRetry(t *testing.T) {
 	}, service.serviceRestartDelay+1*time.Second, 500*time.Millisecond)
 }
 
+func makeServiceForCheckStatus(t *testing.T, installTimeout, uninstallTimeout, checkTimeout time.Duration) *serviceRuntime {
+	log, _ := loggertest.New("test")
+	endpoint := makeEndpointComponent(t, map[string]interface{}{})
+	endpoint.InputSpec.Spec.Service = &component.ServiceSpec{
+		CPort:   9999,
+		CSocket: ".test.sock",
+		Operations: component.ServiceOperationsSpec{
+			Check:     &component.ServiceOperationsCommandSpec{Timeout: checkTimeout},
+			Install:   &component.ServiceOperationsCommandSpec{Timeout: installTimeout},
+			Uninstall: &component.ServiceOperationsCommandSpec{Timeout: uninstallTimeout},
+		},
+	}
+
+	service, err := newServiceRuntime(endpoint, log, true)
+	require.NoError(t, err)
+	// simulate the service already being up and running
+	service.state.State = client.UnitStateHealthy
+
+	// drain state updates so compState/forceCompState never block on service.ch
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-service.ch:
+			}
+		}
+	}()
+
+	return service
+}
+
+// TestUpgradeGracePeriodExceedsMaxServiceTimeout ensures the default upgrade
+// watcher grace period always exceeds the longest service operation timeout so
+// a service that never checks back in is still caught before the watcher gives up.
+// It loads the real endpoint-security spec so a spec change that breaks the
+// invariant fails this test.
+func TestUpgradeGracePeriodExceedsMaxServiceTimeout(t *testing.T) {
+	specData, err := os.ReadFile(filepath.Join("..", "..", "..", "specs", "endpoint-security.spec.yml"))
+	require.NoError(t, err, "reading endpoint-security.spec.yml")
+	spec, err := component.LoadSpec(specData)
+	require.NoError(t, err, "parsing endpoint-security.spec.yml")
+
+	var maxTimeout time.Duration
+	for _, input := range spec.Inputs {
+		if input.Service == nil {
+			continue
+		}
+		ops := input.Service.Operations
+		for _, op := range []*component.ServiceOperationsCommandSpec{ops.Check, ops.Install} {
+			if op != nil && op.Timeout > maxTimeout {
+				maxTimeout = op.Timeout
+			}
+		}
+	}
+	require.NotZero(t, maxTimeout, "endpoint spec must have at least one service operation timeout")
+
+	gracePeriod := configuration.DefaultUpgradeConfig().Watcher.GracePeriod
+	require.Greater(t, gracePeriod, maxTimeout,
+		"upgrade watcher grace period (%v) must exceed max service operation timeout (%v)", gracePeriod, maxTimeout)
+}
+
+func TestServiceCheckinFailureTimeout(t *testing.T) {
+	service := makeServiceForCheckStatus(t, 600*time.Second, 600*time.Second, 60*time.Second)
+	require.Equal(t, 600*time.Second, service.checkinFailureTimeout())
+	require.Equal(t, 20, service.maxCheckinMisses(30*time.Second))
+
+	// falls back to the generic count when nothing is configured
+	noTimeouts := makeServiceForCheckStatus(t, 0, 0, 0)
+	require.Equal(t, time.Duration(0), noTimeouts.checkinFailureTimeout())
+	require.Equal(t, maxCheckinMisses, noTimeouts.maxCheckinMisses(30*time.Second))
+}
+
+func TestServiceCheckStatus(t *testing.T) {
+	const checkinPeriod = 30 * time.Second
+
+	t.Run("normal check-in stays healthy", func(t *testing.T) {
+		service := makeServiceForCheckStatus(t, 600*time.Second, 600*time.Second, 60*time.Second)
+		lastCheckin := time.Now()
+		missedCheckins := 0
+
+		service.checkStatus(checkinPeriod, &lastCheckin, &missedCheckins)
+
+		require.Equal(t, client.UnitStateHealthy, service.state.State)
+		require.Equal(t, 0, missedCheckins)
+	})
+
+	t.Run("slow but within configured operation timeout stays degraded", func(t *testing.T) {
+		service := makeServiceForCheckStatus(t, 600*time.Second, 600*time.Second, 60*time.Second)
+		lastCheckin := time.Now().Add(-150 * time.Second)
+		missedCheckins := 0
+
+		// past the old 90s window, but well under the 600s timeout
+		for i := 0; i < 5; i++ {
+			service.checkStatus(checkinPeriod, &lastCheckin, &missedCheckins)
+		}
+
+		require.Equal(t, client.UnitStateDegraded, service.state.State)
+	})
+
+	t.Run("stuck past the configured operation timeout is marked failed", func(t *testing.T) {
+		service := makeServiceForCheckStatus(t, 600*time.Second, 600*time.Second, 60*time.Second)
+		lastCheckin := time.Now().Add(-660 * time.Second)
+		missedCheckins := 0
+
+		// past the 600s timeout
+		for i := 0; i < 22; i++ {
+			service.checkStatus(checkinPeriod, &lastCheckin, &missedCheckins)
+		}
+
+		require.Equal(t, client.UnitStateFailed, service.state.State)
+	})
+
+	t.Run("component with no configured operation timeouts keeps the generic 90s failure window", func(t *testing.T) {
+		service := makeServiceForCheckStatus(t, 0, 0, 0)
+		lastCheckin := time.Now().Add(-120 * time.Second)
+		missedCheckins := 0
+
+		// past the generic 90s window
+		for i := 0; i < 4; i++ {
+			service.checkStatus(checkinPeriod, &lastCheckin, &missedCheckins)
+		}
+
+		require.Equal(t, client.UnitStateFailed, service.state.State)
+	})
+}
+
 func mockEndpointBinary(t *testing.T, exitCode int) string {
 	// Build a mock Endpoint binary that can return a specific exit code.
 	outPath := filepath.Join(t.TempDir(), "mock_endpoint")
@@ -454,7 +591,8 @@ func mockEndpointBinary(t *testing.T, exitCode int) string {
 		outPath += ".exe"
 	}
 
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		t.Context(),
 		"go", "build",
 		"-o", outPath,
 		"-ldflags", "-X 'main.ExitCode="+strconv.Itoa(exitCode)+"'",

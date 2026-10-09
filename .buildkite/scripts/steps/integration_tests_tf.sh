@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source .buildkite/scripts/retry.sh
 source .buildkite/scripts/steps/ess.sh
 source .buildkite/scripts/steps/fleet.sh
 
 # Make sure that all tools are installed
-asdf install
+retry 3 asdf install
 
 GROUP_NAME=$1
 TEST_SUDO=$2
@@ -26,7 +27,7 @@ ESS_REGION=${ESS_REGION:-""}
 # There is a time when the current snapshot is not available on cloud yet, so we cannot use the latest version automatically
 # This file is managed by an automation (mage integration:UpdateAgentPackageVersion) that check if the snapshot is ready.
 STACK_VERSION="$(jq -r '.stack_version' .package-version)"
-STACK_BUILD_ID="$(jq -r '.stack_build_id' .package-version)"
+STACK_BUILD_ID="$(jq -r '.stack_build_id // ""' .package-version)"
 if [[ "${FIPS:-false}" == "true" ]]; then
   # FRH testing environment does not have same stack build IDs as CFT environment so
   # we just go with the STACK_VERSION.
@@ -54,7 +55,7 @@ else
   export KIBANA_HOST=$(buildkite-agent meta-data get "${METADATA_PREFIX}kibana.host")
   export KIBANA_USERNAME=$(buildkite-agent meta-data get "${METADATA_PREFIX}kibana.username")
   export KIBANA_PASSWORD=$(buildkite-agent meta-data get "${METADATA_PREFIX}kibana.pwd")
-  export INTEGRATIONS_SERVER_HOST=$(buildkite-agent meta-data get "${METADATA_PREFIX}integrations_server.host")
+  export ELASTIC_APM_SERVER_URL=$(buildkite-agent meta-data get "${METADATA_PREFIX}integrations_server.host")
   echo "Elasticsearch Host: ${ELASTICSEARCH_HOST}"
 fi
 
@@ -75,4 +76,3 @@ else
     .buildkite/scripts/buildkite-integration-tests.sh $@
   fi
 fi
-

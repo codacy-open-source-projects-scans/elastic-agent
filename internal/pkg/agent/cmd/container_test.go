@@ -8,11 +8,17 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,8 +28,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/elastic/elastic-agent-libs/kibana"
+	"github.com/elastic/elastic-agent-libs/testing/certutil"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/secret"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/vault"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
 	"github.com/elastic/elastic-agent/internal/pkg/crypto"
@@ -286,6 +296,17 @@ func TestShouldEnroll(t *testing.T) {
 	replaceTokenOther := "test-replace-token-other"
 
 	fleetNetworkErr := errors.New("fleet network error")
+	// connRefusedErr mimics what net/http returns when nothing is listening on the
+	// other end, which is what a Fleet Server run by the agent looks like on a cold start.
+	connRefusedErr := &url.Error{
+		Op:  "Post",
+		URL: "https://localhost:8221/api/fleet/agents/agent-id/acks",
+		Err: &net.OpError{
+			Op:  "dial",
+			Net: "tcp",
+			Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+		},
+	}
 	for name, tc := range map[string]struct {
 		cfg                  setupConfig
 		statFn               func(path string) (os.FileInfo, error)
@@ -522,6 +543,247 @@ func TestShouldEnroll(t *testing.T) {
 						StatusCode: http.StatusOK,
 						Body:       io.NopCloser(strings.NewReader(`{"action": "acks", "items":[]}`)),
 					}, nil).Once()
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should not enroll with own fleet server when stored host is the internal endpoint": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			// FLEET_URL is not set when the agent runs its own Fleet Server; enrollment is pointed at
+			// the internal endpoint instead (see enrollCmd.prepareFleetTLS).
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "https"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`{"action": "acks", "items":[]}`)),
+					}, nil).Once()
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should not enroll with own fleet server when stored host is the internal endpoint as a full url": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  hosts:
+    - "https://localhost:8221"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`{"action": "acks", "items":[]}`)),
+					}, nil).Once()
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should not enroll with own fleet server when fleet url is also set": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			// FLEET_URL is ignored when the agent runs its own Fleet Server; the stored
+			// configuration always points at the internal endpoint.
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, URL: "https://fleet.example.com:8220", EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "https"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`{"action": "acks", "items":[]}`)),
+					}, nil).Once()
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should not enroll with insecure own fleet server when stored host is the internal endpoint": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true, InsecureHTTP: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "http"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`{"action": "acks", "items":[]}`)),
+					}, nil).Once()
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should enroll with own fleet server when the stored protocol differs from the internal endpoint": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			// Stored configuration is from a previous insecure run, the agent is now
+			// configured to run Fleet Server over TLS.
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "http"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			expectedShouldEnroll: true,
+		},
+		"should enroll with own fleet server when stored host is a remote fleet server": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			// Stored configuration is from an enrollment into a remote Fleet Server, the
+			// agent is now configured to run its own Fleet Server.
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "fleet.example.com:8220"
+  protocol: "https"
+agent:
+  id: "agent-id"`)), nil).Once()
+				return m
+			},
+			expectedShouldEnroll: true,
+		},
+		"should not enroll with own fleet server when fleet server is not listening yet": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			// shouldFleetEnroll runs before the agent's own Fleet Server is started, so the
+			// API key cannot be validated. That must not discard the existing enrollment.
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "https"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, connRefusedErr).Times(3)
+				return m
+			},
+			expectedShouldEnroll: false,
+		},
+		"should enroll with own fleet server when the api key was revoked": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			cfg: setupConfig{
+				Fleet:       fleetConfig{Enroll: true, EnrollmentToken: enrollmentToken},
+				FleetServer: fleetServerConfig{Enable: true},
+			},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  host: "localhost:8221"
+  protocol: "https"
+agent:
+  id: "fleet-server-agent-id"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, client.ErrInvalidAPIKey).Once()
+				return m
+			},
+			expectedShouldEnroll: true,
+		},
+		"should not enroll when a remote fleet server is unreachable": {
+			statFn: func(path string) (os.FileInfo, error) { return nil, nil },
+			cfg:    setupConfig{Fleet: fleetConfig{Enroll: true, URL: "https://host1:8220", EnrollmentToken: enrollmentToken}},
+			encryptedDiskStoreFn: func(t *testing.T, savedConfig *configuration.Configuration) storage.Storage {
+				m := storage.NewMockStorage(t)
+				m.On("Load").Return(io.NopCloser(strings.NewReader(`fleet:
+  enabled: true
+  access_api_key: "test-key"
+  enrollment_token_hash: "`+enrollmentTokenHashBase64+`"
+  hosts:
+    - host1:8220
+  agent:
+  protocol: "https"`)), nil).Once()
+				return m
+			},
+			fleetClientFn: func(t *testing.T) client.Sender {
+				m := client.NewMockSender(t)
+				m.On("Send", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, connRefusedErr).Times(3)
 				return m
 			},
 			expectedShouldEnroll: false,
@@ -908,6 +1170,35 @@ agent:
 			if tc.expectedSavedConfig != nil {
 				tc.expectedSavedConfig(t, savedConfig)
 			}
+		})
+	}
+}
+
+func TestGetBootstrapFleetServerURL(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg      fleetServerConfig
+		expected string
+	}{
+		"defaults": {
+			cfg:      fleetServerConfig{Enable: true},
+			expected: "https://localhost:8221",
+		},
+		"insecure http": {
+			cfg:      fleetServerConfig{Enable: true, InsecureHTTP: true},
+			expected: "http://localhost:8221",
+		},
+		"custom external host and port do not change the internal endpoint": {
+			cfg:      fleetServerConfig{Enable: true, Host: "0.0.0.0", Port: "8420"},
+			expected: "https://localhost:8221",
+		},
+		"insecure http with a certificate still serves TLS": {
+			// enrollCmd.prepareFleetTLS only drops to plain HTTP when no certificate is given.
+			cfg:      fleetServerConfig{Enable: true, InsecureHTTP: true, Cert: "/tmp/cert.pem", CertKey: "/tmp/key.pem"},
+			expected: "https://localhost:8221",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.expected, getBootstrapFleetServerURL(tc.cfg))
 		})
 	}
 }
@@ -1314,4 +1605,205 @@ func TestKibanaFetchToken(t *testing.T) {
 		require.Error(t, err)
 		require.Empty(t, token)
 	})
+}
+
+func TestContainerLoggingCfgOverrides(t *testing.T) {
+	tests := []struct {
+		name              string
+		logsPath          string
+		eventsToStderr    string
+		wantToFiles       bool
+		wantToStderr      bool
+		wantEventToFiles  bool
+		wantEventToStderr bool
+	}{
+		{
+			name:              "without custom logs path",
+			eventsToStderr:    "true",
+			wantToFiles:       false,
+			wantToStderr:      true,
+			wantEventToFiles:  false,
+			wantEventToStderr: true,
+		},
+		{
+			name:              "with custom logs path",
+			logsPath:          t.TempDir(),
+			wantToFiles:       true,
+			wantToStderr:      false,
+			wantEventToFiles:  true,
+			wantEventToStderr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("LOGS_PATH", tt.logsPath)
+			t.Setenv("EVENTS_TO_STDERR", tt.eventsToStderr)
+
+			rawCfg := config.MustNewConfigFrom(map[string]any{})
+			require.NoError(t, containerLoggingCfgOverrides(rawCfg))
+
+			cfg, err := configuration.NewFromConfig(rawCfg)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantToFiles, cfg.Settings.LoggingConfig.ToFiles)
+			require.Equal(t, tt.wantToStderr, cfg.Settings.LoggingConfig.ToStderr)
+			require.Equal(t, tt.wantEventToFiles, cfg.Settings.EventLoggingConfig.ToFiles)
+			require.Equal(t, tt.wantEventToStderr, cfg.Settings.EventLoggingConfig.ToStderr)
+		})
+	}
+}
+
+// Regression test for #13810: ensure env vars override fleet.enc for certs
+func TestContainerEnvOverridesFleetTLSPaths(t *testing.T) {
+	_, childPair, err := certutil.NewRSARootAndChildCerts()
+	require.NoError(t, err)
+	certDir := t.TempDir()
+	envCertPath := filepath.Join(certDir, "tls.crt")
+	envKeyPath := filepath.Join(certDir, "tls.key")
+	require.NoError(t, os.WriteFile(envCertPath, childPair.Cert, 0o644))
+	require.NoError(t, os.WriteFile(envKeyPath, childPair.Key, 0o600))
+
+	t.Setenv("ELASTIC_AGENT_CERT", envCertPath)
+	t.Setenv("ELASTIC_AGENT_CERT_KEY", envKeyPath)
+
+	origCfg := paths.Config()
+	t.Cleanup(func() { paths.SetConfig(origCfg) })
+	paths.SetConfig(t.TempDir())
+
+	ctx := t.Context()
+	require.NoError(t, secret.CreateAgentSecret(ctx, vault.WithUnprivileged(true)))
+	require.NoError(t, os.WriteFile(paths.ConfigFile(), []byte("fleet:\n  enabled: true\n"), 0o644))
+
+	store, err := storage.NewEncryptedDiskStore(ctx, paths.AgentConfigFile())
+	require.NoError(t, err)
+	require.NoError(t, store.Save(strings.NewReader(`fleet:
+  ssl:
+    certificate: "/nonexistent/tls.crt"
+    key: "/nonexistent/tls.key"`)))
+
+	_, err = shouldFleetEnroll(setupConfig{Fleet: fleetConfig{Enroll: true}})
+	require.NotErrorIs(t, err, fs.ErrNotExist, "unpack must not try to open stale stored TLS path")
+
+	reloader, err := configuration.NewConfigReloader(ctx, nil, containerCfgOverrides)
+	require.NoError(t, err)
+	loaded := reloader.Configuration()
+	require.Equal(t, envCertPath, loaded.Fleet.Client.Transport.TLS.Certificate.Certificate)
+	require.Equal(t, envKeyPath, loaded.Fleet.Client.Transport.TLS.Certificate.Key)
+}
+
+// Regression test for #15408: FLEET_CA/KIBANA_CA/ELASTICSEARCH_CA overrides fleet.enc CA
+func TestContainerEnvOverridesFleetCA(t *testing.T) {
+	rootPair, _, err := certutil.NewRSARootAndChildCerts()
+	require.NoError(t, err)
+	certDir := t.TempDir()
+	envFleetCAPath := filepath.Join(certDir, "fleet-ca.crt")
+	require.NoError(t, os.WriteFile(envFleetCAPath, rootPair.Cert, 0o644))
+	storedCAPath := filepath.Join(certDir, "stored-ca.crt")
+	require.NoError(t, os.WriteFile(storedCAPath, rootPair.Cert, 0o644))
+	kibanaCAPath := filepath.Join(certDir, "kibana-ca.crt")
+	require.NoError(t, os.WriteFile(kibanaCAPath, rootPair.Cert, 0o644))
+	esCAPath := filepath.Join(certDir, "es-ca.crt")
+	require.NoError(t, os.WriteFile(esCAPath, rootPair.Cert, 0o644))
+
+	origCfg := paths.Config()
+	t.Cleanup(func() { paths.SetConfig(origCfg) })
+	paths.SetConfig(t.TempDir())
+	for _, key := range []string{"FLEET_CA", "KIBANA_CA", "ELASTICSEARCH_CA"} {
+		if orig, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, orig) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(key) })
+		}
+		os.Unsetenv(key)
+	}
+
+	ctx := t.Context()
+	require.NoError(t, secret.CreateAgentSecret(ctx, vault.WithUnprivileged(true)))
+	require.NoError(t, os.WriteFile(paths.ConfigFile(), []byte("fleet:\n  enabled: true\n"), 0o644))
+	store, err := storage.NewEncryptedDiskStore(ctx, paths.AgentConfigFile())
+	require.NoError(t, err)
+
+	cases := []struct {
+		name       string
+		env        map[string]string
+		fleetEncCA string
+		wantCAs    []string
+		wantErr    bool
+	}{
+		{
+			name:       "valid fleet.enc CAs with no overrides",
+			fleetEncCA: storedCAPath,
+			wantCAs:    []string{storedCAPath},
+		},
+		{
+			name:       "invalid fleet.enc CAs with no overrides",
+			fleetEncCA: "/nonexistent/ca.crt",
+			wantErr:    true,
+		},
+		{
+			name:       "set FLEET_CA should override valid fleet.enc CA",
+			fleetEncCA: storedCAPath,
+			env:        map[string]string{"FLEET_CA": envFleetCAPath},
+			wantCAs:    []string{envFleetCAPath},
+		},
+		{
+			name:       "set FLEET_CA should override invalid fleet.enc CA",
+			fleetEncCA: "/nonexistent/ca.crt",
+			env:        map[string]string{"FLEET_CA": envFleetCAPath},
+			wantCAs:    []string{envFleetCAPath},
+		},
+		{
+			name:       "explicitly empty FLEET_CA should override valid fleet.enc",
+			fleetEncCA: storedCAPath,
+			env:        map[string]string{"FLEET_CA": ""},
+			wantCAs:    []string{},
+		},
+		{
+			name:       "explicitly empty FLEET_CA should override invalid fleet.enc",
+			fleetEncCA: "/nonexistent/ca.crt",
+			env:        map[string]string{"FLEET_CA": ""},
+			wantCAs:    []string{},
+		},
+		{
+			name:       "KIBANA_CA should override fleet.enc CAs when FLEET_CA is unset",
+			fleetEncCA: "/nonexistent/ca.crt",
+			env:        map[string]string{"KIBANA_CA": kibanaCAPath},
+			wantCAs:    []string{kibanaCAPath},
+		},
+		{
+			name:       "ELASTICSEARCH_CA should override fleet.enc CAs when FLEET_CA and KIBANA_CA are unset",
+			fleetEncCA: "/nonexistent/ca.crt",
+			env:        map[string]string{"ELASTICSEARCH_CA": esCAPath},
+			wantCAs:    []string{esCAPath},
+		},
+		{
+			name:       "explicitly empty FLEET_CA should take precedence over set KIBANA_CA and ELASTICSEARCH_CA",
+			fleetEncCA: "/nonexistent/ca.crt",
+			env:        map[string]string{"FLEET_CA": "", "KIBANA_CA": kibanaCAPath, "ELASTICSEARCH_CA": esCAPath},
+			wantCAs:    []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, store.Save(strings.NewReader(fmt.Sprintf(`fleet:
+  ssl:
+    certificate_authorities:
+      - %q`, tc.fleetEncCA))))
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := shouldFleetEnroll(setupConfig{Fleet: fleetConfig{Enroll: true}})
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				reloader, err := configuration.NewConfigReloader(ctx, nil, containerCfgOverrides)
+				require.NoError(t, err)
+				loaded := reloader.Configuration()
+				require.Equal(t, tc.wantCAs, loaded.Fleet.Client.Transport.TLS.CAs)
+			}
+		})
+	}
 }

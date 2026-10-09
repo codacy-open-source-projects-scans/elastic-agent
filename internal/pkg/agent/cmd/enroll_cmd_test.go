@@ -7,10 +7,7 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"io"
 	"net"
 	"net/http"
@@ -28,7 +25,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/elastic-agent-libs/testing/certutil"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/enroll"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
@@ -542,6 +538,123 @@ func TestEnroll(t *testing.T) {
 			assert.Equal(t, host, config.Client.Host)
 		},
 	))
+
+	t.Run("default fleet checkin mode is the standard mode", withServer(
+		func(t *testing.T) *http.ServeMux {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/fleet/agents/enroll", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`
+{
+    "action": "created",
+    "item": {
+        "id": "a9328860-ec54-11e9-93c4-d72ab8a69391",
+        "active": true,
+        "policy_id": "69f3f5a0-ec52-11e9-93c4-d72ab8a69391",
+        "type": "PERMANENT",
+        "enrolled_at": "2019-10-11T18:26:37.158Z",
+        "user_provided_metadata": {},
+        "local_metadata": {
+            "platform": "linux",
+            "version": "8.0.0"
+        },
+        "actions": [],
+        "access_api_key": "my-access-api-key"
+    }
+}`))
+			})
+			return mux
+		}, func(t *testing.T, host string) {
+			url := "http://" + host
+			store := &mockStore{}
+			cmd, err := newEnrollCmd(
+				log,
+				&enroll.EnrollOptions{
+					URL:               url,
+					CAs:               []string{},
+					EnrollAPIKey:      "my-enrollment-api-key",
+					Insecure:          true,
+					SkipCreateSecret:  skipCreateSecret,
+					SkipDaemonRestart: true,
+				},
+				"",
+				store,
+				nil,
+			)
+			require.NoError(t, err)
+
+			streams, _, _, _ := cli.NewTestingIOStreams()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+			defer cancel()
+			err = cmd.Execute(ctx, streams)
+			require.NoError(t, err, "enroll command should return no error")
+
+			assert.True(t, store.Called, "the store should have been called")
+			cfg, err := readConfig(store.Content)
+			require.NoError(t, err)
+			require.Equal(t, configuration.FleetCheckinModeStandard, cfg.Checkin.GetMode())
+		},
+	))
+
+	t.Run("checkin-on-state-change flag configures on_state_change checkin mode", withServer(
+		func(t *testing.T) *http.ServeMux {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/fleet/agents/enroll", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`
+{
+    "action": "created",
+    "item": {
+        "id": "a9328860-ec54-11e9-93c4-d72ab8a69391",
+        "active": true,
+        "policy_id": "69f3f5a0-ec52-11e9-93c4-d72ab8a69391",
+        "type": "PERMANENT",
+        "enrolled_at": "2019-10-11T18:26:37.158Z",
+        "user_provided_metadata": {},
+        "local_metadata": {
+            "platform": "linux",
+            "version": "8.0.0"
+        },
+        "actions": [],
+        "access_api_key": "my-access-api-key"
+    }
+}`))
+			})
+			return mux
+		}, func(t *testing.T, host string) {
+			url := "http://" + host
+			store := &mockStore{}
+			cmd, err := newEnrollCmd(
+				log,
+				&enroll.EnrollOptions{
+					URL:                  url,
+					CAs:                  []string{},
+					EnrollAPIKey:         "my-enrollment-api-key",
+					Insecure:             true,
+					SkipCreateSecret:     skipCreateSecret,
+					SkipDaemonRestart:    true,
+					CheckinOnStateChange: true,
+				},
+				"",
+				store,
+				nil,
+			)
+			require.NoError(t, err)
+
+			streams, _, _, _ := cli.NewTestingIOStreams()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+			defer cancel()
+			err = cmd.Execute(ctx, streams)
+			require.NoError(t, err, "enroll command should return no error")
+
+			assert.True(t, store.Called, "the store should have been called")
+			cfg, err := readConfig(store.Content)
+			require.NoError(t, err)
+			require.NotNil(t, cfg.Checkin)
+			assert.Equal(t, configuration.FleetCheckinModeOnStateChange, cfg.Checkin.Mode)
+			assert.Equal(t, configuration.CheckinCompressionGzip, cfg.Checkin.GetCompression())
+		},
+	))
 }
 
 func TestValidateArgs(t *testing.T) {
@@ -806,7 +919,8 @@ func withTLSServer(
 		serverCert, err := tls.X509KeyPair(pair.Crt, pair.Key)
 		require.NoError(t, err)
 
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		var lc net.ListenConfig
+		listener, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 		require.NoError(t, err)
 		defer listener.Close()
 
@@ -824,81 +938,6 @@ func withTLSServer(
 		go s.ServeTLS(listener, "", "") //nolint:errcheck // not required
 
 		test(t, ca.Crt(), "localhost:"+strconv.Itoa(port))
-	}
-}
-
-// mTLSServer generates the necessary certificates and tls.Config for a mTLS
-// server. If agentPassphrase is given, it'll encrypt the agent's client
-// certificate key.
-// It returns the *tls.Config to be used with httptest.NewUnstartedServer,
-// the agentRootPair, agentChildPair, fleetRootPathPair, fleetCertPathPair.
-// Theirs Cert and Key values are the path to the respective certificate and
-// certificate key in PEM format.
-func mTLSServer(t *testing.T, agentPassphrase string) (
-	*tls.Config, certutil.Pair, certutil.Pair, certutil.Pair, certutil.Pair) {
-
-	dir := t.TempDir()
-
-	// generate certificates
-	agentRootPair, agentCertPair, err := certutil.NewRootAndChildCerts()
-	require.NoError(t, err, "could not create agent's root CA and child certificate")
-
-	// encrypt keys if needed
-	if agentPassphrase != "" {
-		agentChildDERKey, _ := pem.Decode(agentCertPair.Key)
-		require.NoError(t, err, "could not create tls.Certificates from child certificate")
-
-		encPem, err := x509.EncryptPEMBlock( //nolint:staticcheck // we need to drop support for this, but while we don't, it needs to be tested.
-			rand.Reader,
-			"EC PRIVATE KEY",
-			agentChildDERKey.Bytes,
-			[]byte(agentPassphrase),
-			x509.PEMCipherAES128)
-		require.NoError(t, err, "failed encrypting agent child certificate key block")
-
-		agentCertPair.Key = pem.EncodeToMemory(encPem)
-	}
-
-	agentRootPathPair := savePair(t, dir, "agent_ca", agentRootPair)
-	agentCertPathPair := savePair(t, dir, "agent_cert", agentCertPair)
-
-	fleetRootPair, fleetChildPair, err := certutil.NewRootAndChildCerts()
-	require.NoError(t, err, "could not create fleet-server's root CA and child certificate")
-	fleetRootPathPair := savePair(t, dir, "fleet_ca", fleetRootPair)
-	fleetCertPathPair := savePair(t, dir, "fleet_cert", fleetChildPair)
-
-	// configure server's TLS
-	fleetRootCertPool := x509.NewCertPool()
-	fleetRootCertPool.AppendCertsFromPEM(fleetRootPair.Cert)
-	cert, err := tls.X509KeyPair(fleetChildPair.Cert, fleetChildPair.Key)
-	require.NoError(t, err, "could not create tls.Certificates from child certificate")
-
-	agentRootCertPool := x509.NewCertPool()
-	agentRootCertPool.AppendCertsFromPEM(agentRootPair.Cert)
-
-	cfg := &tls.Config{ //nolint:gosec // it's just a test
-		RootCAs:      fleetRootCertPool,
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    agentRootCertPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	}
-
-	return cfg, agentRootPathPair, agentCertPathPair, fleetRootPathPair, fleetCertPathPair
-}
-
-// savePair saves the key pair on {dest}/{name}.pem and {dest}/{name}_key.pem
-func savePair(t *testing.T, dest string, name string, pair certutil.Pair) certutil.Pair {
-	certPath := filepath.Join(dest, name+".pem")
-	err := os.WriteFile(certPath, pair.Cert, 0o600)
-	require.NoErrorf(t, err, "could not save %s certificate", name)
-
-	keyPath := filepath.Join(dest, name+"_key.pem")
-	err = os.WriteFile(keyPath, pair.Key, 0o600)
-	require.NoErrorf(t, err, "could not save %s certificate key", name)
-
-	return certutil.Pair{
-		Cert: []byte(certPath),
-		Key:  []byte(keyPath),
 	}
 }
 
@@ -950,6 +989,10 @@ func Test_EnrollCmd_PrepareFleetServerTLS(t *testing.T) {
 		name string
 		cfg  enroll.EnrollCmdFleetServerOption
 		url  string
+		// containerCfg is the container setup configuration that produces cfg, see
+		// buildEnrollArgs. shouldFleetEnroll has to predict the URL derived here from it,
+		// so both are asserted together to keep them from drifting apart.
+		containerCfg fleetServerConfig
 	}{{
 		name: "with cert",
 		cfg: enroll.EnrollCmdFleetServerOption{
@@ -958,7 +1001,8 @@ func Test_EnrollCmd_PrepareFleetServerTLS(t *testing.T) {
 			Cert:         "exmple-cert",
 			CertKey:      "example-key",
 		},
-		url: "https://localhost:8221",
+		url:          "https://localhost:8221",
+		containerCfg: fleetServerConfig{Enable: true, Cert: "exmple-cert", CertKey: "example-key"},
 	}, {
 		name: "insecure",
 		cfg: enroll.EnrollCmdFleetServerOption{
@@ -966,7 +1010,19 @@ func Test_EnrollCmd_PrepareFleetServerTLS(t *testing.T) {
 			ConnStr:      "http://elastic.internal:9220",
 			InternalPort: defaultFleetServerInternalPort,
 		},
-		url: "http://localhost:8221",
+		url:          "http://localhost:8221",
+		containerCfg: fleetServerConfig{Enable: true, InsecureHTTP: true},
+	}, {
+		// the default for a container that only sets FLEET_SERVER_ENABLE: no certificate
+		// is given, so one is self-signed, and the enrollment URL is still rewritten to
+		// the internal endpoint.
+		name: "self-signed",
+		cfg: enroll.EnrollCmdFleetServerOption{
+			ConnStr:      "http://elastic.internal:9220",
+			InternalPort: defaultFleetServerInternalPort,
+		},
+		url:          "https://localhost:8221",
+		containerCfg: fleetServerConfig{Enable: true},
 	}}
 	log, _ := loggertest.New("Test_EnrollCmd_PrepareFleetServerTLS")
 	for _, tt := range tests {
@@ -981,6 +1037,8 @@ func Test_EnrollCmd_PrepareFleetServerTLS(t *testing.T) {
 			err := c.prepareFleetTLS()
 			require.NoError(t, err)
 			require.Equal(t, tt.url, c.options.URL)
+			require.Equal(t, c.options.URL, getBootstrapFleetServerURL(tt.containerCfg),
+				"the URL predicted by shouldFleetEnroll no longer matches the one enrollment uses")
 		})
 	}
 }

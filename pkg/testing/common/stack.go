@@ -41,6 +41,13 @@ type Stack struct {
 	// Password is the password.
 	Password string `yaml:"password"`
 
+	// CACert is the PEM-encoded CA certificate that signed the stack's
+	// Elasticsearch/Kibana/Fleet Server certificates. It is empty when the stack
+	// uses publicly-trusted certificates (e.g. cloud ESS); local stacks that serve
+	// TLS with a self-signed CA set it so the runner can install it into the test
+	// instance's trust store.
+	CACert string `yaml:"ca_cert"`
+
 	// Internal holds internal information used by the provisioner.
 	// Best to not touch the contents of this, and leave it be for
 	// the provisioner.
@@ -61,12 +68,19 @@ type StackRequest struct {
 
 	// Version is the version of the stack.
 	Version string `yaml:"version"`
+
+	// KibanaMemoryMB overrides the Kibana instance memory (MiB).
+	// When 0 the provisioner default is used.
+	KibanaMemoryMB int `yaml:"kibana_memory_mb,omitempty"`
 }
 
 // StackProvisioner performs the provisioning of stacks.
 type StackProvisioner interface {
 	// Name returns the name of the stack provisioner.
 	Name() string
+
+	// Location returns whether the provisioned stack runs locally or remotely.
+	Location() ProvisionerLocation
 
 	// SetLogger sets the logger for it to use.
 	SetLogger(l Logger)

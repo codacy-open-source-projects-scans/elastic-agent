@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/josephspurrier/goversioninfo"
@@ -83,13 +84,13 @@ func DefaultBuildArgs(cfg *Settings) BuildArgs {
 		CGO:  build.Default.CgoEnabled,
 		Env:  map[string]string{},
 		Vars: map[string]string{
-			elasticAgentModulePath + "/version.buildTime": "{{ date }}",
-			elasticAgentModulePath + "/version.commit":    "{{ commit }}",
+			elasticAgentModulePath + "/version.buildTime": cfg.BuildDateString(),
+			elasticAgentModulePath + "/version.commit":    cfg.Build.CommitHash(),
 		},
 		WinMetadata: true,
 	}
 	if cfg.Build.VersionQualified {
-		args.Vars[elasticAgentModulePath+"/version.qualifier"] = "{{ .Qualifier }}"
+		args.Vars[elasticAgentModulePath+"/version.qualifier"] = cfg.Build.VersionQualifier
 	}
 
 	if positionIndependentCodeSupported(cfg) {
@@ -98,13 +99,16 @@ func DefaultBuildArgs(cfg *Settings) BuildArgs {
 
 	if cfg.Build.FIPSBuild {
 		fipsConfig := packaging.Settings().FIPS
-
-		for _, tag := range fipsConfig.Compile.Tags {
-			args.ExtraFlags = append(args.ExtraFlags, "-tags="+tag)
-		}
-		args.CGO = args.CGO || fipsConfig.Compile.CGO
-		for varName, value := range fipsConfig.Compile.Env {
-			args.Env[varName] = value
+		platform := cfg.Platform()
+		if slices.ContainsFunc(fipsConfig.Compile.Platforms, func(p packaging.Platform) bool {
+			return p.Platform() == platform.Name
+		}) {
+			for _, tag := range fipsConfig.Compile.Tags {
+				args.ExtraFlags = append(args.ExtraFlags, "-tags="+tag)
+			}
+			for varName, value := range fipsConfig.Compile.Env {
+				args.Env[varName] = value
+			}
 		}
 	}
 
@@ -172,9 +176,6 @@ func GolangCrossBuild(ctx context.Context, cfg *Settings, params BuildArgs) erro
 		return errors.New("use the crossBuild target. golangCrossBuild can " +
 			"only be executed within the golang-crossbuild docker environment")
 	}
-
-	defer DockerChown(filepath.Join(params.OutputDir, params.Name+binaryExtension(cfg.Build.GOOS)))
-	defer DockerChown(filepath.Join(params.OutputDir))
 
 	mountPoint := cfg.ElasticBeatsDir
 	if err := sh.Run("git", "config", "--global", "--add", "safe.directory", mountPoint); err != nil {
@@ -299,12 +300,9 @@ func Run(ctx context.Context, env map[string]string, stdout, stderr io.Writer, c
 // allows users to view metadata about the exe in the Details tab of the file
 // properties viewer.
 func MakeWindowsSysoFile(cfg *Settings) (string, error) {
-	version := cfg.BeatQualifiedVersion()
+	version := cfg.AgentQualifiedCoreVersion()
 
-	commit, err := cfg.Build.CommitHash()
-	if err != nil {
-		return "", err
-	}
+	commit := cfg.Build.CommitHash()
 
 	major, minor, patch, err := ParseVersion(version)
 	if err != nil {

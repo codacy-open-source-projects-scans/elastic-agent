@@ -5,7 +5,6 @@
 package filesource
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/elastic-agent/internal/pkg/composable"
 	ctesting "github.com/elastic/elastic-agent/internal/pkg/composable/testing"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
@@ -71,8 +69,7 @@ func TestContextProvider_Config(t *testing.T) {
 			log, err := logger.New("filesource_test", false)
 			require.NoError(t, err)
 
-			builder, _ := composable.Providers.GetContextProvider("filesource")
-			_, err = builder(log, s.Config, true)
+			_, err = ContextProviderBuilder(log, s.Config, true)
 			if s.Err != nil {
 				require.Equal(t, s.Err, err)
 			} else {
@@ -118,12 +115,10 @@ func TestContextProvider(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	builder, _ := composable.Providers.GetContextProvider("filesource")
-	provider, err := builder(log, c, true)
+	provider, err := ContextProviderBuilder(log, c, true)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	comm := ctesting.NewContextComm(ctx)
 	setChan := make(chan map[string]interface{})
 	comm.CallOnSet(func(value map[string]interface{}) {
@@ -131,9 +126,16 @@ func TestContextProvider(t *testing.T) {
 		setChan <- value
 	})
 
+	// Ensure the provider goroutine exits and closes its fsnotify watcher
+	// before t.TempDir's cleanup runs RemoveAll; on Windows the watcher
+	// holds an open directory handle that blocks deletion.
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		_ = provider.Run(ctx, comm)
 	}()
+	t.Cleanup(func() { wg.Wait() })
 
 	// wait for it to be called once
 	var current map[string]interface{}
@@ -241,8 +243,7 @@ func TestContextProvider_KubernetesSymlinks(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	builder, _ := composable.Providers.GetContextProvider("filesource")
-	provider, err := builder(log, c, true)
+	provider, err := ContextProviderBuilder(log, c, true)
 	require.NoError(t, err)
 
 	ctx := t.Context()

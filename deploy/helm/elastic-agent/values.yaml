@@ -71,11 +71,11 @@ outputs:
     # -- contents to the client certificate for the output
     # @section -- 1.1 - Output Object
     # @key -- outputs.{name}.ssl.certificate.value
-    #  value: ""      
+    #  value: ""
     # -- path to the client private key for the output
     # @section -- 1.1 - Output Object
     # @key -- outputs.{name}.ssl.key
-    #  key: 
+    #  key:
     # -- path to the client private key for the output
     # @section -- 1.1 - Output Object
     # @key -- outputs.{name}.ssl.key.valueFromSecret
@@ -351,7 +351,6 @@ autoOps:
   enabled: false
   autoops_token: ""
   autoops_otel_url: ""
-  autoops_temp_resource_id: ""
   es_api_key: ""
   es_username: ""
   es_password: ""
@@ -450,13 +449,13 @@ extraIntegrations: {}
 agent:
   # -- elastic-agent version
   # @section -- 6 - Elastic-Agent Configuration
-  version: 9.5.0
+  version: 9.6.0
   # -- image configuration
   # @section -- 6 - Elastic-Agent Configuration
   image:
     repository: docker.elastic.co/elastic-agent/elastic-agent
     pullPolicy: IfNotPresent
-    tag: "9.5.0-SNAPSHOT"
+    tag: "9.6.0-SNAPSHOT"
   # -- image pull secrets
   # @section -- 6 - Elastic-Agent Configuration
   imagePullSecrets: []
@@ -466,6 +465,16 @@ agent:
   # -- enable unprivileged mode
   # @section -- 6 - Elastic-Agent Configuration
   unprivileged: false
+  # -- OpenShift-specific configuration
+  # @section -- 6 - Elastic-Agent Configuration
+  openshift:
+    # -- OpenShift detection mode. auto detects via API groups, true always enables, false always disables
+    # @section -- 6 - Elastic-Agent Configuration
+    enabled: auto
+    securityContextConstraints:
+      # -- create the SecurityContextConstraints and RoleBindings that let the agent and kube-state-metrics service accounts run on OpenShift
+      # @section -- 6 - Elastic-Agent Configuration
+      create: true
   fleet:
     # -- enable elastic-agent managed
     # @section -- 6.1 - Elastic-Agent Managed Configuration

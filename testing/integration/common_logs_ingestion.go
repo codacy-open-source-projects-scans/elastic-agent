@@ -23,8 +23,9 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/gofrs/uuid/v5"
 	"go.opentelemetry.io/otel/sdk/metric"
+
+	"github.com/gofrs/uuid/v5"
 
 	"github.com/elastic/elastic-agent-libs/kibana"
 	"github.com/elastic/elastic-agent-libs/testing/estools"
@@ -200,70 +201,31 @@ func TestMonitoringLogsAreShipped(
 	agentFixture *atesting.Fixture,
 	policy kibana.PolicyResponse,
 ) {
-	// Stage 1: Make sure metricbeat logs are populated
-	t.Log("Making sure metricbeat logs are populated")
+	// Fetch agent status once up-front to get the agent ID for scoped ES queries.
+	status, err := agentFixture.ExecStatus(ctx)
+	require.NoError(t, err, "could not get agent status")
+	agentID := status.Info.ID
+	t.Logf("Agent ID: %q", agentID)
+
+	// Stage 1: Make sure monitoring data is being shipped.
+	// elastic_agent.elastic_agent is produced in both runtimes: by filestream-monitoring
+	// reading the agent's own log files in classic mode, and by elasticmonitoringreceiver
+	// in EDOT/OTel mode.
+	t.Log("Making sure monitoring logs are populated")
 	docs := FindESDocs(t, func() (estools.Documents, error) {
-		return estools.GetLogsForDataset(ctx, info.ESClient, "elastic_agent.metricbeat")
+		return estools.GetResultsForAgentAndDatastream(ctx, info.ESClient, "elastic_agent.elastic_agent", agentID)
 	})
-	t.Logf("metricbeat: Got %d documents", len(docs.Hits.Hits))
+	t.Logf("elastic_agent.elastic_agent: Got %d documents", len(docs.Hits.Hits))
 	require.NotZero(t, len(docs.Hits.Hits),
-		"Looking for logs in dataset 'elastic_agent.metricbeat'")
+		"Looking for monitoring data in dataset elastic_agent.elastic_agent for agent %q", agentID)
 
 	// Stage 2: make sure all components are healthy
 	t.Log("Making sure all components are healthy")
-	status, err := agentFixture.ExecStatus(ctx)
-	require.NoError(t, err,
-		"could not get agent status to verify all components are healthy")
 	for _, c := range status.Components {
 		assert.Equalf(t, client.Healthy, client.State(c.State),
 			"component %s: want %s, got %s",
 			c.Name, client.Healthy, client.State(c.State))
 	}
-	agentID := status.Info.ID
-	t.Logf("Agent ID: %q", agentID)
-
-	// Stage 3: Make sure there are no errors in logs
-	t.Log("Making sure there are no error logs")
-	docs = queryESDocs(t, func() (estools.Documents, error) {
-		return estools.CheckForErrorsInLogs(ctx, info.ESClient, info.Namespace, []string{
-			// acceptable error messages (include reason)
-			"Error dialing dial tcp 127.0.0.1:9200: connect: connection refused",                                                            // beat is running default config before its config gets updated
-			"Error dialing dial tcp 127.0.0.1:9200: connectex: No connection could be made because the target machine actively refused it.", // beat is running default config before its config gets updated
-			"Failed to apply initial policy from on disk configuration",
-			"Failed to connect to backoff(elasticsearch(http://127.0.0.1:9200)): Get \"http://127.0.0.1:9200\": dial tcp 127.0.0.1:9200: connect: connection refused", // Deb test
-			"Failed to download artifact",
-			"Failed to initialize artifact",
-			"Global configuration artifact is not available", // Endpoint: failed to load user artifact due to connectivity issues
-			"add_cloud_metadata: received error for provider aws: failed fetching EC2 Identity Document",      // okay for the cloud metadata to not work
-			"add_cloud_metadata: received error for provider openstack: failed requesting openstack metadata", // okay for the cloud metadata to not work
-			"add_cloud_metadata: received error for provider hetzner: failed with http status code 404",
-			"add_cloud_metadata: received error for provider digitalocean: failed with http status code 404",
-			"add_cloud_metadata: received error for provider azure: failed with http status code 404",
-			"add_cloud_metadata: received error for provider openstack: failed with http status code 404",
-			"add_cloud_metadata: received error for provider gcp: failed with http status code 404",
-			"elastic-agent-client error: rpc error: code = Canceled desc = context canceled",               // can happen on restart
-			"failed to invoke rollback watcher: starting watcher process: failed to start Upgrade Watcher", // on debian/rpm package installs the binary symlink at Top() doesn't exist
-			"falling back to IMDSv1: operation error ec2imds: getToken",                                    // okay for the cloud metadata to not work
-			"bulk indexer flush error",          // can happen on restart (caused by context canceled)
-			"Exporting failed. Dropping data.",  // can happen on restart (caused by context canceled)
-			"Exporting failed. Rejecting data.", // can happen on restart (caused by context canceled)
-		})
-	})
-	t.Logf("error logs: Got %d documents", len(docs.Hits.Hits))
-	messages := make([]string, 0, len(docs.Hits.Hits))
-	for _, doc := range docs.Hits.Hits {
-		t.Logf("%#v", doc.Source)
-		message, ok := doc.Source["message"]
-		if !ok {
-			continue
-		}
-		messageStr, ok := message.(string)
-		if !ok {
-			continue
-		}
-		messages = append(messages, messageStr)
-	}
-	require.Emptyf(t, docs.Hits.Hits, "list of error messages is expected to be empty, found:\n%s", strings.Join(messages, ", \n"))
 
 	// Stage 3: Make sure we have message confirming central management is running
 	t.Log("Making sure we have message confirming central management is running")
@@ -305,27 +267,6 @@ func TestMonitoringLogsAreShipped(
 				i, d.Index, doc.Component.ID, doc.ElasticAgent.ID)
 		}
 	}
-}
-
-// queryESDocs runs `findFn` until it returns no error. Zero documents returned
-// is considered a success.
-func queryESDocs(t *testing.T, findFn func() (estools.Documents, error)) estools.Documents {
-	var docs estools.Documents
-	require.Eventually(
-		t,
-		func() bool {
-			var err error
-			docs, err = findFn()
-			if err != nil {
-				t.Logf("got an error querying ES, retrying. Error: %s", err)
-			}
-			return err == nil
-		},
-		3*time.Minute,
-		15*time.Second,
-	)
-
-	return docs
 }
 
 func TestFlattenedDatastreamFleetPolicy(

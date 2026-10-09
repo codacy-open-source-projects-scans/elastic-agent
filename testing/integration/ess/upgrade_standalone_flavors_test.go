@@ -7,7 +7,6 @@
 package ess
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"testing"
@@ -29,6 +28,11 @@ func TestStandaloneUpgrade_Flavor_Basic(t *testing.T) {
 		Group: integration.UpgradeFlavor,
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
+		// Pre-9.3 elastic-agent releases lack "windows-binary-arm64" in their
+		// upgrade artifact packageArchMap (added by PR #11673), so the older
+		// start-versions in the upgrade matrix cannot fetch the windows/arm64
+		// artifact.
+		SkipOS: []define.OS{{Type: define.Windows, Arch: define.ARM64}},
 	})
 
 	minVersion := upgradetest.Version_9_0_0_SNAPSHOT
@@ -49,7 +53,7 @@ func TestStandaloneUpgrade_Flavor_Basic(t *testing.T) {
 	require.NoError(t, err)
 
 	checkFn := func(t *testing.T, fixture *atesting.Fixture) {
-		testComponentsPresence(context.Background(), fixture,
+		testComponentsPresence(t.Context(), fixture,
 			[]componentPresenceDefinition{
 				{"elastic-otel-collector", []string{"windows", "linux", "darwin"}},
 				{"endpoint-security", []string{"windows", "linux", "darwin"}},
@@ -96,6 +100,12 @@ func TestStandaloneUpgrade_Flavor_Servers(t *testing.T) {
 		Group: integration.UpgradeFlavor,
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
+		// apm-server has no windows/arm64 build
+		// (see dev-tools/packaging/packages.yml: comp-apm_server),
+		// so the "servers" flavor cannot be exercised on this combination. The
+		// older agents in the upgrade matrix additionally lack windows/arm64
+		// support in their upgrade artifact map (PR #11673).
+		SkipOS: []define.OS{{Type: define.Windows, Arch: define.ARM64}},
 	})
 
 	minVersion := upgradetest.Version_9_0_0_SNAPSHOT
@@ -116,7 +126,7 @@ func TestStandaloneUpgrade_Flavor_Servers(t *testing.T) {
 	require.NoError(t, err)
 
 	checkFn := func(t *testing.T, fixture *atesting.Fixture) {
-		testComponentsPresence(context.Background(), fixture,
+		testComponentsPresence(t.Context(), fixture,
 			[]componentPresenceDefinition{
 				{"elastic-otel-collector", []string{"windows", "linux", "darwin"}},
 				{"endpoint-security", []string{"windows", "linux", "darwin"}},
@@ -162,6 +172,11 @@ func TestStandaloneUpgrade_Flavor_UpgradeFromUnflavored(t *testing.T) {
 		Group: integration.UpgradeFlavor,
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
+		// Pre-9.3 elastic-agent releases lack "windows-binary-arm64" in their
+		// upgrade artifact packageArchMap (added by PR #11673), so the older
+		// start-versions in the upgrade matrix cannot fetch the windows/arm64
+		// artifact.
+		SkipOS: []define.OS{{Type: define.Windows, Arch: define.ARM64}},
 	})
 
 	minVersion := upgradetest.Version_9_0_0_SNAPSHOT
@@ -182,7 +197,7 @@ func TestStandaloneUpgrade_Flavor_UpgradeFromUnflavored(t *testing.T) {
 	require.NoError(t, err)
 
 	checkFn := func(t *testing.T, fixture *atesting.Fixture) {
-		testComponentsPresence(context.Background(), fixture,
+		testComponentsPresence(t.Context(), fixture,
 			[]componentPresenceDefinition{
 				{"elastic-otel-collector", []string{"windows", "linux", "darwin"}},
 				{"endpoint-security", []string{"windows", "linux", "darwin"}},
@@ -224,7 +239,7 @@ func TestStandaloneUpgrade_Flavor_UpgradeFromUnflavored(t *testing.T) {
 }
 
 func testStandaloneUpgradeFlavorCheck(t *testing.T, startVersion *version.ParsedSemVer, endVersion string, unprivileged bool, hasServers bool, flavorCheck func(t *testing.T, f *atesting.Fixture)) {
-	ctx, cancel := testcontext.WithDeadline(t, context.Background(), time.Now().Add(10*time.Minute))
+	ctx, cancel := testcontext.WithDeadline(t, t.Context(), time.Now().Add(10*time.Minute))
 	defer cancel()
 
 	startFixture, err := atesting.NewFixture(

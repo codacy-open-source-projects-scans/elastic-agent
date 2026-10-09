@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/features"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 )
 
 const (
@@ -26,6 +26,7 @@ type stateStore interface {
 	SetAckToken(ackToken string)
 	Save() error
 	Action() fleetapi.Action
+	SaveAction(fleetapi.Action) error
 }
 
 // Unenroll results in  running agent entering idle state, non managed non standalone.

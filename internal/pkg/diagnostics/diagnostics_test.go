@@ -10,6 +10,8 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,6 +28,7 @@ import (
 
 	agentclient "github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/redact"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
 	agentruntime "github.com/elastic/elastic-agent/pkg/component/runtime"
@@ -34,7 +37,7 @@ import (
 	"github.com/elastic/elastic-agent/version"
 )
 
-const REDACTED_URL_USERNAME_PASSWORD = REDACTED_URL_SAFE + ":" + REDACTED_URL_SAFE
+const REDACTED_URL_USERNAME_PASSWORD = redact.REDACTED + ":" + redact.REDACTED
 
 func TestRedactResults(t *testing.T) {
 	privKey := `-----BEGIN OPENSSH PRIVATE KEY-----
@@ -90,6 +93,7 @@ i4EFZLWrFRsAAAARYWxleGtAZ3JlbWluLm5lc3QBAg==
 	exampleConfig := mapstr.M{
 		"root": mapstr.M{
 			"passphrase": "unredacted",
+			//nolint:gosec // fake credentials for testing
 			"nested1": mapstr.M{
 				"url":         "https://unredacted:unredacted@my-url1",
 				"certificate": "unredacted",
@@ -115,31 +119,72 @@ i4EFZLWrFRsAAAARYWxleGtAZ3JlbWluLm5lc3QBAg==
 		},
 	}
 
-	formatted, err := yaml.Marshal(exampleConfig)
-	require.NoError(t, err)
-	errOut := strings.Builder{}
-	outWriter := strings.Builder{}
-	res := client.DiagnosticFileResult{Content: formatted, ContentType: "application/yaml"}
+	tests := []struct {
+		name        string
+		contentType string
+		marshal     func(any) ([]byte, error)
+	}{
+		{
+			name:        "YAML top-level array",
+			contentType: "application/yaml",
+			marshal:     yaml.Marshal,
+		},
+		{
+			name:        "JSON top-level array",
+			contentType: "application/json",
+			marshal:     json.Marshal,
+		},
+	}
 
-	err = writeRedacted(&errOut, &outWriter, "test/path", res)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted, err := tc.marshal([]any{exampleConfig})
+			require.NoError(t, err)
+			errOut := strings.Builder{}
+			outWriter := strings.Builder{}
+			res := client.DiagnosticFileResult{Content: formatted, ContentType: tc.contentType}
 
-	require.Empty(t, errOut.String())
-	require.NotContains(t, outWriter.String(), "unredacted")
-	require.NotContains(t, outWriter.String(), privKey)
+			err = writeRedacted(&errOut, &outWriter, "test/path", res)
+			require.NoError(t, err)
+
+			require.Empty(t, errOut.String())
+			require.NotContains(t, outWriter.String(), "unredacted")
+			require.NotContains(t, outWriter.String(), privKey)
+		})
+	}
 }
 
 func TestRedactPlainString(t *testing.T) {
-	errOut := strings.Builder{}
-	outWriter := strings.Builder{}
-	inputString := "Just a string"
-	res := client.DiagnosticFileResult{Content: []byte(inputString), ContentType: "application/yaml"}
+	tests := []struct {
+		name        string
+		input       string
+		contentType string
+	}{
+		{
+			name:        "YAML scalar is unchanged",
+			input:       "Just a string",
+			contentType: "application/yaml",
+		},
+		{
+			name:        "JSON scalar is unchanged",
+			input:       `"Just a string"`,
+			contentType: "application/json",
+		},
+	}
 
-	err := writeRedacted(&errOut, &outWriter, "test/path", res)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errOut := strings.Builder{}
+			outWriter := strings.Builder{}
+			res := client.DiagnosticFileResult{Content: []byte(tc.input), ContentType: tc.contentType}
 
-	require.Empty(t, errOut.String())
-	require.Equal(t, outWriter.String(), inputString)
+			err := writeRedacted(&errOut, &outWriter, "test/path", res)
+			require.NoError(t, err)
+
+			require.Empty(t, errOut.String())
+			require.Equal(t, tc.input, outWriter.String())
+		})
+	}
 }
 
 func TestRedactComplexKeys(t *testing.T) {
@@ -197,7 +242,7 @@ func TestRedactWithMarkers(t *testing.T) {
 				"inputs": []any{
 					map[string]any{
 						"type":      "test_input",
-						"redactKey": REDACTED,
+						"redactKey": redact.REDACTED,
 						"urls": []any{
 							"https://" + REDACTED_URL_USERNAME_PASSWORD + "@my-url1",
 							"https://" + REDACTED_URL_USERNAME_PASSWORD + "@my-url2",
@@ -208,8 +253,8 @@ func TestRedactWithMarkers(t *testing.T) {
 				"outputs": map[string]any{
 					"default": map[string]any{
 						"type":           "elasticsearch",
-						"api_key":        REDACTED,
-						"redactOtherKey": REDACTED,
+						"api_key":        redact.REDACTED,
+						"redactOtherKey": redact.REDACTED,
 					},
 				},
 			},
@@ -222,6 +267,7 @@ func TestRedactWithMarkers(t *testing.T) {
 					},
 				},
 				"outputs": map[string]any{
+					//nolint:gosec // fake credentials for testing
 					"default": map[string]any{
 						"type":        "elasticsearch",
 						"url":         "https://username:password@my-url",
@@ -245,11 +291,11 @@ func TestRedactWithMarkers(t *testing.T) {
 						"type":        "elasticsearch",
 						"url":         "https://" + REDACTED_URL_USERNAME_PASSWORD + "@my-url",
 						"other_url":   "https://my-unredacted-url",
-						"api_key":     REDACTED,
-						"Certificate": REDACTED,
-						"PassPhrase":  REDACTED,
-						"PASSWORD":    REDACTED,
-						"tOkEn":       REDACTED,
+						"api_key":     redact.REDACTED,
+						"Certificate": redact.REDACTED,
+						"PassPhrase":  redact.REDACTED,
+						"PASSWORD":    redact.REDACTED,
+						"tOkEn":       redact.REDACTED,
 					},
 				},
 			},
@@ -276,14 +322,14 @@ func TestRedactWithMarkers(t *testing.T) {
 				"inputs": []any{
 					map[string]any{
 						"type":      "test_input",
-						"redactKey": REDACTED,
+						"redactKey": redact.REDACTED,
 					},
 				},
 				"outputs": map[string]any{
 					"default": map[string]any{
 						"type":           "elasticsearch",
-						"api_key":        REDACTED,
-						"redactOtherKey": REDACTED,
+						"api_key":        redact.REDACTED,
+						"redactOtherKey": redact.REDACTED,
 					},
 				},
 			},
@@ -346,7 +392,7 @@ func TestRedactWithMarkers(t *testing.T) {
 										map[string]any{
 											"set": map[string]any{
 												"target": "header.Authorization",
-												"value":  REDACTED,
+												"value":  redact.REDACTED,
 											},
 										},
 										map[string]any{
@@ -359,7 +405,7 @@ func TestRedactWithMarkers(t *testing.T) {
 								},
 							},
 							map[string]any{
-								"mock_stream_config": REDACTED,
+								"mock_stream_config": redact.REDACTED,
 							},
 						},
 					},
@@ -419,6 +465,112 @@ type zippedItem struct {
 	IsDir bool
 }
 
+func TestZipArchiveUnitDirSkip(t *testing.T) {
+	compID := "my-component"
+	compDiags := []client.DiagnosticComponentResult{{ComponentID: compID}}
+
+	tests := []struct {
+		name          string
+		unitDiags     []client.DiagnosticUnitResult
+		expectedPaths []string
+	}{
+		{
+			name: "unit with no results and no error is skipped",
+			unitDiags: []client.DiagnosticUnitResult{
+				{ComponentID: compID, UnitID: compID + "-input"},
+			},
+			expectedPaths: []string{
+				"components/",
+				"components/my-component/",
+				"logs/",
+			},
+		},
+		{
+			name: "unit with error creates dir and error.txt",
+			unitDiags: []client.DiagnosticUnitResult{
+				{ComponentID: compID, UnitID: compID + "-input", Err: errors.New("something failed")},
+			},
+			expectedPaths: []string{
+				"components/",
+				"components/my-component/",
+				"components/my-component/input/",
+				"components/my-component/input/error.txt",
+				"logs/",
+			},
+		},
+		{
+			name: "unit with results creates dir and file",
+			unitDiags: []client.DiagnosticUnitResult{
+				{
+					ComponentID: compID,
+					UnitID:      compID + "-input",
+					Results: []client.DiagnosticFileResult{
+						{Filename: "beat_metrics.json", ContentType: "application/json", Content: []byte(`{}`)},
+					},
+				},
+			},
+			expectedPaths: []string{
+				"components/",
+				"components/my-component/",
+				"components/my-component/input/",
+				"components/my-component/input/beat_metrics.json",
+				"logs/",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			topPath := t.TempDir()
+			// zipLogs opens topPath/data; create it so ZipArchive doesn't fail
+			require.NoError(t, os.MkdirAll(filepath.Join(topPath, "data"), 0o700))
+
+			buf := new(bytes.Buffer)
+			err := ZipArchive(io.Discard, buf, topPath, nil, tc.unitDiags, compDiags, true)
+			require.NoError(t, err)
+
+			r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+			require.NoError(t, err)
+
+			// One component per case, so the zip entry order is deterministic and safe to assert.
+			var paths []string
+			for _, f := range r.File {
+				paths = append(paths, f.Name)
+			}
+			assert.Equal(t, tc.expectedPaths, paths)
+		})
+	}
+}
+
+func TestZipArchiveComponentStreamSubdir(t *testing.T) {
+	topPath := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(topPath, "data"), 0o700))
+
+	compDiags := []client.DiagnosticComponentResult{{
+		ComponentID: "filestream-default",
+		Results: []client.DiagnosticFileResult{
+			{Filename: "stream-a/beat_metrics.json", ContentType: "application/json", Content: []byte(`{"a":1}`)},
+			{Filename: "stream-b/beat_metrics.json", ContentType: "application/json", Content: []byte(`{"b":2}`)},
+			{Filename: "system-cpu/input_metrics.json", ContentType: "application/json", Content: []byte(`{"c":3}`)},
+		},
+	}}
+
+	buf := new(bytes.Buffer)
+	err := ZipArchive(io.Discard, buf, topPath, nil, nil, compDiags, true)
+	require.NoError(t, err)
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	var paths []string
+	for _, f := range r.File {
+		paths = append(paths, f.Name)
+	}
+	assert.Contains(t, paths, "components/filestream-default/stream-a/beat_metrics.json")
+	assert.Contains(t, paths, "components/filestream-default/stream-b/beat_metrics.json")
+	assert.Contains(t, paths, "components/filestream-default/system-cpu/input_metrics.json")
+}
+
 func TestZipLogs(t *testing.T) {
 	topPath := t.TempDir()
 	dir := filepath.Join(paths.HomeFrom(topPath), "logs", "sub-dir")
@@ -444,6 +596,7 @@ func TestZipLogs(t *testing.T) {
 				{"logs/elastic-agent-unknow/events/elastic-agent-events-log.ndjson", false},
 				{"logs/elastic-agent-unknow/sub-dir/", true},
 				{"logs/elastic-agent-unknow/sub-dir/log.ndjson", false},
+				{"logs/elastic-agent-unknow/components/", true},
 			},
 		},
 
@@ -455,6 +608,7 @@ func TestZipLogs(t *testing.T) {
 				{"logs/elastic-agent-unknow/", true},
 				{"logs/elastic-agent-unknow/sub-dir/", true},
 				{"logs/elastic-agent-unknow/sub-dir/log.ndjson", false},
+				{"logs/elastic-agent-unknow/components/", true},
 			},
 		},
 	}
@@ -466,13 +620,270 @@ func TestZipLogs(t *testing.T) {
 	}
 }
 
+func TestZipLogsComponentsLogs(t *testing.T) {
+	topPath := t.TempDir()
+	homePath := paths.HomeFrom(topPath)
+	// Create the versioned home so zipLogs iterates the current version.
+	require.NoError(t, os.MkdirAll(filepath.Join(homePath, "logs"), 0o700))
+
+	// Components may write logs under {pathsHome}/components/logs.
+	traceDir := filepath.Join(homePath, "components", "logs", "httpjson")
+	require.NoError(t, os.MkdirAll(traceDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(traceDir, "http-request-trace-test.ndjson"), []byte(".\n"), 0o600))
+
+	expected := []zippedItem{
+		{"logs/", true},
+		{"logs/elastic-agent-unknow/", true},
+		{"logs/elastic-agent-unknow/components/", true},
+		{"logs/elastic-agent-unknow/components/httpjson/", true},
+		{"logs/elastic-agent-unknow/components/httpjson/http-request-trace-test.ndjson", false},
+	}
+
+	buf := new(bytes.Buffer)
+	w := zip.NewWriter(buf)
+	require.NoError(t, zipLogs(w, time.Now(), topPath, filepath.Join(paths.HomeFrom(topPath), "components"), true, io.Discard))
+	require.NoError(t, w.Close())
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+	var observed []zippedItem
+	for _, f := range r.File {
+		observed = append(observed, zippedItem{Name: f.Name, IsDir: f.FileInfo().IsDir()})
+	}
+
+	// The components walk and the versioned-home walk emit entries in a different order than a strict
+	// depth-first walk would, so compare without ordering.
+	assert.ElementsMatch(t, expected, observed)
+}
+
+func TestZipLogsComponentsLogsMultiVersionedHome(t *testing.T) {
+	topPath := t.TempDir()
+	dataPath := paths.DataFrom(topPath)
+
+	// Two versioned homes under data: currentDir matches paths.HomeFrom, oldDir is a stale version.
+	currentDir := filepath.Base(paths.HomeFrom(topPath))
+	oldDir := "elastic-agent-oldversion"
+	require.NoError(t, os.MkdirAll(filepath.Join(dataPath, currentDir, "logs"), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(dataPath, oldDir, "logs"), 0o700))
+
+	// Components may write logs under each version's own components/logs.
+	traceDir := filepath.Join(dataPath, currentDir, "components", "logs", "httpjson")
+	require.NoError(t, os.MkdirAll(traceDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(traceDir, "http-request-trace-test.ndjson"), []byte(".\n"), 0o600))
+
+	buf := new(bytes.Buffer)
+	w := zip.NewWriter(buf)
+	require.NoError(t, zipLogs(w, time.Now(), topPath, filepath.Join(paths.HomeFrom(topPath), "components"), true, io.Discard))
+	require.NoError(t, w.Close())
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	// Component trace logs land under logs/<version>/components/httpjson/ mirroring the source layout.
+	traceName := "logs/" + currentDir + "/components/httpjson/http-request-trace-test.ndjson"
+	var count int
+	for _, f := range r.File {
+		if f.Name == traceName {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "trace file should appear exactly once, attributed to the current version")
+}
+
+// TestZipLogsConflictingNames checks that every log file gets a unique zip entry and
+// its content is preserved, across all sources that could produce the same filename:
+// agent logs vs component logs, multiple components sharing the same filename, and
+// multiple versioned homes.
+func TestZipLogsConflictingNames(t *testing.T) {
+	topPath := t.TempDir()
+	dataPath := paths.DataFrom(topPath)
+	currentDir := filepath.Base(paths.HomeFrom(topPath))
+	oldDir := "elastic-agent-oldversion"
+
+	mkfile := func(path, content string) {
+		t.Helper()
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	}
+
+	// Current versioned home: agent log and two components all share the same filename.
+	mkfile(filepath.Join(dataPath, currentDir, "logs", "httpjson", "trace.ndjson"), "current-agent\n")
+	mkfile(filepath.Join(dataPath, currentDir, "components", "logs", "httpjson", "trace.ndjson"), "current-httpjson\n")
+	mkfile(filepath.Join(dataPath, currentDir, "components", "logs", "filestream", "trace.ndjson"), "current-filestream\n")
+
+	// Old versioned home: same filenames repeated.
+	mkfile(filepath.Join(dataPath, oldDir, "logs", "httpjson", "trace.ndjson"), "old-agent\n")
+	mkfile(filepath.Join(dataPath, oldDir, "components", "logs", "httpjson", "trace.ndjson"), "old-httpjson\n")
+
+	buf := new(bytes.Buffer)
+	w := zip.NewWriter(buf)
+	require.NoError(t, zipLogs(w, time.Now(), topPath, filepath.Join(paths.HomeFrom(topPath), "components"), true, io.Discard))
+	require.NoError(t, w.Close())
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	want := map[string]string{
+		"logs/" + currentDir + "/httpjson/trace.ndjson":              "current-agent\n",
+		"logs/" + currentDir + "/components/httpjson/trace.ndjson":   "current-httpjson\n",
+		"logs/" + currentDir + "/components/filestream/trace.ndjson": "current-filestream\n",
+		"logs/" + oldDir + "/httpjson/trace.ndjson":                  "old-agent\n",
+		"logs/" + oldDir + "/components/httpjson/trace.ndjson":       "old-httpjson\n",
+	}
+
+	counts := make(map[string]int)
+	contents := make(map[string]string)
+	for _, f := range r.File {
+		counts[f.Name]++
+		if _, ok := want[f.Name]; ok {
+			rc, err := f.Open()
+			require.NoError(t, err)
+			data, err := io.ReadAll(rc)
+			rc.Close()
+			require.NoError(t, err)
+			contents[f.Name] = string(data)
+		}
+	}
+
+	for name, wantContent := range want {
+		assert.Equal(t, 1, counts[name], "entry %q should appear exactly once", name)
+		assert.Equal(t, wantContent, contents[name], "entry %q has wrong content", name)
+	}
+}
+
+func TestZipLogsUnversionedHome(t *testing.T) {
+	originalVersionHome := paths.IsVersionHome()
+	t.Cleanup(func() { paths.SetVersionHome(originalVersionHome) })
+	// Container layout: the home path is unversioned and logs live directly under the top path.
+	paths.SetVersionHome(false)
+
+	topPath := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(topPath, "logs"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(topPath, "logs", "log.ndjson"), []byte(".\n"), 0o600))
+
+	// Component logs (e.g. beat receiver trace logs) live under components/logs.
+	require.NoError(t, os.MkdirAll(filepath.Join(topPath, "components", "logs", "httpjson"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(topPath, "components", "logs", "httpjson", "trace.ndjson"), []byte(".\n"), 0o600))
+
+	buf := new(bytes.Buffer)
+	w := zip.NewWriter(buf)
+	componentsPath := filepath.Join(topPath, "components")
+	require.NoError(t, zipLogs(w, time.Now(), topPath, componentsPath, true, io.Discard))
+	require.NoError(t, w.Close())
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	names := make(map[string]struct{}, len(r.File))
+	for _, f := range r.File {
+		names[f.Name] = struct{}{}
+	}
+
+	base := filepath.Base(topPath)
+	assert.Contains(t, names, "logs/"+base+"/log.ndjson", "agent log should be in zip")
+	assert.Contains(t, names, "logs/"+base+"/components/httpjson/trace.ndjson", "component log should be in zip")
+}
+
+// TestZipLogsUnversionedHomeDivergentComponents covers the container layout where
+// the configured data/state path (topPath) differs from the install home where
+// components run — both trees must appear in the bundle (see https://github.com/elastic/elastic-agent/issues/15771).
+func TestZipLogsUnversionedHomeDivergentComponents(t *testing.T) {
+	originalVersionHome := paths.IsVersionHome()
+	t.Cleanup(func() { paths.SetVersionHome(originalVersionHome) })
+	paths.SetVersionHome(false)
+
+	root := t.TempDir()
+
+	// Simulate the configured data/state path (topPath = STATE_PATH/data).
+	topPath := filepath.Join(root, "state", "data")
+	require.NoError(t, os.MkdirAll(filepath.Join(topPath, "logs"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(topPath, "logs", "elastic-agent.ndjson"), []byte(".\n"), 0o600))
+
+	// Simulate the install tree (paths.Components() origin), separate from topPath.
+	installHash := "elastic-agent-abc123"
+	installHome := filepath.Join(root, "data", installHash)
+	componentsPath := filepath.Join(installHome, "components")
+	require.NoError(t, os.MkdirAll(filepath.Join(componentsPath, "logs", "cel"), 0o700))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(componentsPath, "logs", "cel", "http-request-trace-test.ndjson"),
+		[]byte(".\n"), 0o600))
+
+	buf := new(bytes.Buffer)
+	w := zip.NewWriter(buf)
+	require.NoError(t, zipLogs(w, time.Now(), topPath, componentsPath, true, io.Discard))
+	require.NoError(t, w.Close())
+
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+
+	names := make(map[string]struct{}, len(r.File))
+	for _, f := range r.File {
+		names[f.Name] = struct{}{}
+	}
+
+	base := filepath.Base(topPath) // "data"
+	assert.Contains(t, names, "logs/"+base+"/elastic-agent.ndjson",
+		"agent log under topPath should be in zip")
+	assert.Contains(t, names, "logs/"+installHash+"/components/cel/http-request-trace-test.ndjson",
+		"component trace log under install tree should be in zip")
+}
+
+// TestSaveLogs verifies the error-handling contract of saveLogs:
+// source-file errors are non-fatal (warning logged, nil returned) and
+// zip-writer errors are fatal (error returned, no warning logged).
+func TestSaveLogs(t *testing.T) {
+	t.Run("missing source file is non-fatal", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		w := zip.NewWriter(buf)
+		errOut := new(bytes.Buffer)
+
+		err := saveLogs("test.ndjson", filepath.Join(t.TempDir(), "nonexistent.ndjson"), w, errOut)
+
+		assert.NoError(t, err)
+		assert.Empty(t, errOut.String())
+	})
+
+	t.Run("broken zip writer is fatal", func(t *testing.T) {
+		// zip.NewWriter wraps the underlying writer in a bufio.Writer (4 KB buffer),
+		// so small writes never reach the broken writer — they sit in the bufio.
+		// The deflate compressor emits a compressed block every ~32 768 tokens; for
+		// truly incompressible data (LCG bytes, no back-references) each token is one
+		// literal byte, so a 40 KB incompressible file forces the compressor to emit a
+		// ~32 KB block during io.Copy, overflowing the bufio and surfacing the error
+		// inside saveLogs before it returns.
+		const dataSize = 40 * 1024
+		data := make([]byte, dataSize)
+		v := uint32(0xdeadbeef)
+		for i := range data {
+			v = v*1664525 + 1013904223 // Knuth LCG — uniform, no short repetitions
+			data[i] = byte(v >> 24)
+		}
+		logFile := filepath.Join(t.TempDir(), "agent.ndjson")
+		require.NoError(t, os.WriteFile(logFile, data, 0o600))
+
+		w := zip.NewWriter(alwaysErrWriter{})
+		errOut := new(bytes.Buffer)
+
+		err := saveLogs("test.ndjson", logFile, w, errOut)
+
+		assert.Error(t, err)
+		assert.Empty(t, errOut.String()) // returned as error, not logged as warning
+	})
+}
+
+// alwaysErrWriter is an io.Writer that always returns an error, used to simulate a broken zip writer.
+type alwaysErrWriter struct{}
+
+func (alwaysErrWriter) Write([]byte) (int, error) { return 0, errors.New("write error") }
+
 func zipLogsAndAssertFiles(t *testing.T, topPath string, excludeEvents bool, expected []zippedItem) {
 	t.Helper()
 
 	// Zip the logs directory.
 	buf := new(bytes.Buffer)
 	w := zip.NewWriter(buf)
-	require.NoError(t, zipLogs(w, time.Now(), topPath, excludeEvents))
+	componentsPath := filepath.Join(paths.HomeFrom(topPath), "components")
+	require.NoError(t, zipLogs(w, time.Now(), topPath, componentsPath, excludeEvents, io.Discard))
 	require.NoError(t, w.Close())
 
 	// Read back the contents.
@@ -834,13 +1245,13 @@ func TestRedactSSLKeyInInputs(t *testing.T) {
 	require.NoError(t, err)
 
 	var errOut bytes.Buffer
-	redacted := Redact(unmarshalled, &errOut)
+	redact.Redact(unmarshalled, RedactOpts(&errOut)...)
 	assert.Equalf(t, 0, errOut.Len(), "Unexpected errors written when redacting secrets: %s", errOut.String())
-	require.NotNil(t, redacted)
+	require.NotNil(t, unmarshalled)
 
-	require.Contains(t, redacted, "inputs")
-	inputs, ok := redacted["inputs"].([]any)
-	require.Truef(t, ok, "expected inputs to be slice, detected: %T", redacted["inputs"])
+	require.Contains(t, unmarshalled, "inputs")
+	inputs, ok := unmarshalled["inputs"].([]any)
+	require.Truef(t, ok, "expected inputs to be slice, detected: %T", unmarshalled["inputs"])
 	require.Len(t, inputs, 1)
 	input, ok := inputs[0].(map[string]any)
 	require.True(t, ok, "expected input to be object, detected: %T", inputs[0])
@@ -850,9 +1261,9 @@ func TestRedactSSLKeyInInputs(t *testing.T) {
 	top, ok := input["ssl"].(map[string]any)
 	require.True(t, ok, "expected type to be object, detected: %T", input["ssl"])
 	require.Contains(t, top, "certificate")
-	assert.Equal(t, REDACTED, top["certificate"])
+	assert.Equal(t, redact.REDACTED, top["certificate"])
 	require.Contains(t, top, "key")
-	assert.Equal(t, REDACTED, top["key"])
+	assert.Equal(t, redact.REDACTED, top["key"])
 
 	// check nested object
 	require.Contains(t, input, "nested")
@@ -862,9 +1273,9 @@ func TestRedactSSLKeyInInputs(t *testing.T) {
 	nestedSSL, ok := nested["ssl"].(map[string]any)
 	require.True(t, ok, "expected type to be object, detected: %T", nested["ssl"])
 	require.Contains(t, nestedSSL, "certificate")
-	assert.Equal(t, REDACTED, nestedSSL["certificate"])
+	assert.Equal(t, redact.REDACTED, nestedSSL["certificate"])
 	require.Contains(t, nestedSSL, "key")
-	assert.Equal(t, REDACTED, nestedSSL["key"])
+	assert.Equal(t, redact.REDACTED, nestedSSL["key"])
 
 	// check nested slice
 	require.Contains(t, input, "slice")
@@ -877,9 +1288,102 @@ func TestRedactSSLKeyInInputs(t *testing.T) {
 	sliceSSL, ok := elem["ssl"].(map[string]any)
 	require.True(t, ok, "expected type to be object, detected: %T", elem["ssl"])
 	require.Contains(t, sliceSSL, "certificate")
-	assert.Equal(t, REDACTED, sliceSSL["certificate"])
+	assert.Equal(t, redact.REDACTED, sliceSSL["certificate"])
 	require.Contains(t, sliceSSL, "key")
-	assert.Equal(t, REDACTED, sliceSSL["key"])
+	assert.Equal(t, redact.REDACTED, sliceSSL["key"])
+}
+
+func TestRedactNameValuePair(t *testing.T) {
+	tests := map[string]struct {
+		input  map[string]any
+		expect map[string]any
+	}{
+		"sensitive name redacts sibling value": {
+			input: map[string]any{
+				"headers": []any{
+					map[string]any{
+						"name":  "Authorization",
+						"value": "Bearer SecretValue",
+					},
+				},
+			},
+			expect: map[string]any{
+				"headers": []any{
+					map[string]any{
+						"name":  "Authorization",
+						"value": redact.REDACTED,
+					},
+				},
+			},
+		},
+		"non-sensitive name leaves value untouched": {
+			input: map[string]any{
+				"headers": []any{
+					map[string]any{
+						"name":  "Accept",
+						"value": "application/json",
+					},
+				},
+			},
+			expect: map[string]any{
+				"headers": []any{
+					map[string]any{
+						"name":  "Accept",
+						"value": "application/json",
+					},
+				},
+			},
+		},
+		"case insensitive name key with sensitive value": {
+			input: map[string]any{
+				"Name":  "API-Key",
+				"Value": "actual-secret",
+			},
+			expect: map[string]any{
+				"Name":  "API-Key",
+				"Value": redact.REDACTED,
+			},
+		},
+		"ignored key value is not redacted": {
+			input: map[string]any{
+				"params": []any{
+					map[string]any{
+						"name":  redactionRouteKey,
+						"value": "some-route-id",
+					},
+				},
+			},
+			expect: map[string]any{
+				"params": []any{
+					map[string]any{
+						"name":  redactionRouteKey,
+						"value": "some-route-id",
+					},
+				},
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			input, err := yaml.Marshal(tc.input)
+			require.NoError(t, err)
+
+			file := client.DiagnosticFileResult{Content: input, ContentType: "application/yaml"}
+			var out bytes.Buffer
+			var errOut bytes.Buffer
+
+			err = writeRedacted(&errOut, &out, "testPath", file)
+			require.NoError(t, err)
+			require.Empty(t, errOut.String(), "unexpected redaction errors: %s", errOut.String())
+
+			var actual map[string]any
+			err = yaml.Unmarshal(out.Bytes(), &actual)
+			require.NoError(t, err, "failed to unmarshal output")
+
+			assert.Equal(t, tc.expect, actual, "output does not match expected")
+		})
+	}
 }
 
 func TestRedactEnv(t *testing.T) {
@@ -908,11 +1412,12 @@ func TestRedactEnv(t *testing.T) {
 		expect: map[string]any{
 			"TEST_LEVEL":    "test-val",
 			"VAL1":          "a,b,c",
-			"API_KEY":       REDACTED,
-			"SERVICE_TOKEN": REDACTED,
+			"API_KEY":       redact.REDACTED,
+			"SERVICE_TOKEN": redact.REDACTED,
 		},
 	}, {
 		name: "Redacts value based on key and URL",
+		//nolint:gosec // fake credentials for testing
 		env: map[string]string{
 			"TEST_LEVEL":    "test-val",
 			"VAL1":          "a,b,c",
@@ -924,10 +1429,40 @@ func TestRedactEnv(t *testing.T) {
 		expect: map[string]any{
 			"TEST_LEVEL":    "test-val",
 			"VAL1":          "a,b,c",
-			"API_KEY":       REDACTED,
-			"SECRET_URL":    REDACTED, // key name wins
-			"SERVICE_TOKEN": REDACTED,
+			"API_KEY":       redact.REDACTED,
+			"SECRET_URL":    redact.REDACTED, // key name wins
+			"SERVICE_TOKEN": redact.REDACTED,
 			"HTTPS_PROXY":   "https://" + REDACTED_URL_USERNAME_PASSWORD + "@my-proxy",
+		},
+	}, {
+		name: "Redacts sensitive header embedded in FLEET_HEADER value",
+		env: map[string]string{
+			"FLEET_HEADER": "X-Elastic-App-Auth=eyJhbGciOiJSUzI1NiJ9.eyJraW5kIjoia2liYW5hIn0.sig",
+			"FLEET_URL":    "https://fleet.example.com:443",
+		},
+		expect: map[string]any{
+			"FLEET_HEADER":                     redact.REDACTED,
+			"FLEET_HEADER::X-Elastic-App-Auth": redact.REDACTED,
+			"FLEET_URL":                        "https://fleet.example.com:443",
+		},
+	}, {
+		name: "Redacts sensitive header embedded in FLEET_HEADERS value, preserves innocuous headers",
+		env: map[string]string{
+			"FLEET_HEADERS": "X-Elastic-App-Auth=eyJhbGciOiJSUzI1NiJ9.eyJraW5kIjoia2liYW5hIn0.sig,Accept=application/json",
+		},
+		expect: map[string]any{
+			"FLEET_HEADERS":                     redact.REDACTED,
+			"FLEET_HEADERS::X-Elastic-App-Auth": redact.REDACTED,
+			"FLEET_HEADERS::Accept":             "application/json",
+		},
+	}, {
+		name: "Redacts sensitive header embedded in FLEET_KIBANA_HEADER value",
+		env: map[string]string{
+			"FLEET_KIBANA_HEADER": "X-Elastic-App-Auth=eyJhbGciOiJSUzI1NiJ9.eyJraW5kIjoia2liYW5hIn0.sig",
+		},
+		expect: map[string]any{
+			"FLEET_KIBANA_HEADER":                     redact.REDACTED,
+			"FLEET_KIBANA_HEADER::X-Elastic-App-Auth": redact.REDACTED,
 		},
 	}}
 
@@ -936,7 +1471,7 @@ func TestRedactEnv(t *testing.T) {
 			for k, v := range tt.env {
 				t.Setenv(k, v)
 			}
-			redacted, err := redactEnv()
+			redacted, err := RedactEnv()
 			require.NoError(t, err)
 
 			// redacted includes full env vars, we want to check if the expected k:v's are present

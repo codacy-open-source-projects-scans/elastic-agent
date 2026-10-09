@@ -12,15 +12,16 @@ import (
 	"go.opentelemetry.io/collector/component/componentstatus"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/pkg/component"
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-libs/logp"
 
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/otel/translate"
 	"github.com/elastic/elastic-agent/pkg/component/runtime"
 	agentclient "github.com/elastic/elastic-agent/pkg/control/v2/client"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 )
 
 // State provides the current state of the coordinator along with all the current states of components and units.
@@ -39,10 +40,21 @@ type State struct {
 
 	Components []runtime.ComponentComponentState `yaml:"components"`
 	LogLevel   logp.Level                        `yaml:"log_level"`
+	Tags       []string                          `yaml:"tags,omitempty"`
 
 	Collector *status.AggregateStatus
 
 	UpgradeDetails *details.Details `yaml:"upgrade_details,omitempty"`
+
+	// PolicyApplied is true once the agent has received and processed at least
+	// one policy. Before this point Components may be empty even if the policy
+	// includes components.
+	PolicyApplied bool `yaml:"policy_applied"`
+
+	// PolicyConfiguredActionTypes maps each action type to the IDs of components in
+	// the current policy that are configured to handle it. Unlike Components, this
+	// includes components that have not yet emitted a runtime state update.
+	PolicyConfiguredActionTypes map[string][]string `yaml:"policy_configured_action_types,omitempty"`
 }
 
 type coordinatorOverrideState struct {
@@ -115,11 +127,11 @@ func (c *Coordinator) setConfigError(err error) {
 	c.stateNeedsRefresh = true
 }
 
-// setComponentGenError updates the error state for generating a component
+// setComponentModelError updates the error state for generating a component
 // model from an AST and variables.
 // Called on the main Coordinator goroutine.
-func (c *Coordinator) setComponentGenError(err error) {
-	c.componentGenErr = err
+func (c *Coordinator) setComponentModelError(err error) {
+	c.componentModelErr = err
 	c.stateNeedsRefresh = true
 }
 
@@ -216,7 +228,15 @@ func (c *Coordinator) generateReportableState() (s State) {
 	s.FleetState = c.state.FleetState
 	s.FleetMessage = c.state.FleetMessage
 	s.LogLevel = c.state.LogLevel
+	s.Tags = slices.Clone(c.state.Tags)
 	s.UpgradeDetails = c.state.UpgradeDetails
+	s.PolicyApplied = c.state.PolicyApplied
+	if len(c.state.PolicyConfiguredActionTypes) > 0 {
+		s.PolicyConfiguredActionTypes = make(map[string][]string, len(c.state.PolicyConfiguredActionTypes))
+		for typ, ids := range c.state.PolicyConfiguredActionTypes {
+			s.PolicyConfiguredActionTypes[typ] = append([]string(nil), ids...)
+		}
+	}
 	s.Components = make([]runtime.ComponentComponentState, len(c.state.Components))
 	copy(s.Components, c.state.Components)
 	if c.state.Collector != nil {
@@ -236,9 +256,9 @@ func (c *Coordinator) generateReportableState() (s State) {
 	} else if c.configErr != nil {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Invalid policy: %s", c.configErr.Error())
-	} else if c.componentGenErr != nil {
+	} else if c.componentModelErr != nil {
 		s.State = agentclient.Failed
-		s.Message = fmt.Sprintf("Invalid component model: %s", c.componentGenErr.Error())
+		s.Message = fmt.Sprintf("Invalid component model: %s", c.componentModelErr.Error())
 	} else if c.runtimeUpdateErr != nil {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Runtime update failed: %s", c.runtimeUpdateErr.Error())
@@ -249,8 +269,13 @@ func (c *Coordinator) generateReportableState() (s State) {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Config manager: %s", c.configMgrErr.Error())
 	} else if c.actionsErr != nil {
-		s.State = agentclient.Failed
-		s.Message = fmt.Sprintf("Actions: %s", c.actionsErr.Error())
+		if errors.IsRecoverable(c.actionsErr) {
+			s.State = agentclient.Degraded
+			s.Message = fmt.Sprintf("Actions degraded: %s", c.actionsErr.Error())
+		} else {
+			s.State = agentclient.Failed
+			s.Message = fmt.Sprintf("Actions failed: %s", c.actionsErr.Error())
+		}
 	} else if c.varsMgrErr != nil {
 		s.State = agentclient.Failed
 		s.Message = fmt.Sprintf("Vars manager: %s", c.varsMgrErr.Error())
@@ -289,6 +314,14 @@ func (c *Coordinator) setFleetState(state agentclient.State, message string) {
 // Must be called on the main Coordinator goroutine.
 func (c *Coordinator) setLogLevel(logLevel logp.Level) {
 	c.state.LogLevel = logLevel
+	c.stateNeedsRefresh = true
+}
+
+// setTags updates the agent tags and broadcasts the change.
+// Must be called on the main Coordinator goroutine.
+func (c *Coordinator) setTags(tags []string) {
+	c.agentInfo.SetTags(tags)
+	c.state.Tags = tags
 	c.stateNeedsRefresh = true
 }
 

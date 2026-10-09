@@ -19,13 +19,14 @@ import (
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/service"
 
+	"github.com/elastic/beats/v7/libbeat/beat"
+
 	edotOtelCol "github.com/elastic/elastic-agent/internal/edot/otelcol"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
-	"github.com/elastic/elastic-agent/internal/pkg/otel/extension/elasticdiagnostics"
 	"github.com/elastic/elastic-agent/internal/pkg/otel/manager"
 	"github.com/elastic/elastic-agent/internal/pkg/otel/monitoring"
 	"github.com/elastic/elastic-agent/internal/pkg/release"
+	"github.com/elastic/elastic-agent/internal/pkg/util"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 )
 
@@ -34,7 +35,12 @@ const (
 	defaultStateDirectory = agentBaseDirectory + "/state" // directory that will hold the state data
 )
 
-func NewOtelCommandWithArgs(args []string, streams *cli.IOStreams) *cobra.Command {
+// initBeatHostnameFromEnv sets the process-wide Beat hostname override from ELASTIC_AGENT_HOSTNAME.
+func initBeatHostnameFromEnv() {
+	beat.SetHostnameOverride(util.HostnameOverride())
+}
+
+func NewOtelCommandWithArgs(args []string, streams *cli.IOStreams, componentsFn func() (otelcol.Factories, error)) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "otel",
 		Short: "Start the Elastic Agent in otel mode",
@@ -59,7 +65,7 @@ func NewOtelCommandWithArgs(args []string, streams *cli.IOStreams) *cobra.Comman
 			if err := prepareEnv(); err != nil {
 				return err
 			}
-			return RunCollector(cmd.Context(), cfgFiles, supervised, supervisedLoggingLevel, supervisedMonitoringURL)
+			return RunCollector(cmd.Context(), cfgFiles, supervised, supervisedLoggingLevel, supervisedMonitoringURL, componentsFn)
 		},
 		PreRun: func(c *cobra.Command, args []string) {
 			// hide inherited flags not to bloat help with flags not related to otel
@@ -76,8 +82,8 @@ func NewOtelCommandWithArgs(args []string, streams *cli.IOStreams) *cobra.Comman
 	})
 
 	SetupOtelFlags(cmd.Flags())
-	cmd.AddCommand(newValidateCommandWithArgs(args, streams))
-	cmd.AddCommand(newComponentsCommandWithArgs(args, streams))
+	cmd.AddCommand(newValidateCommandWithArgs(args, streams, componentsFn))
+	cmd.AddCommand(newComponentsCommandWithArgs(args, streams, componentsFn))
 	cmd.AddCommand(newOtelDiagnosticsCommand(streams))
 
 	return cmd
@@ -89,8 +95,16 @@ func hideInheritedFlags(c *cobra.Command) {
 	})
 }
 
-func RunCollector(cmdCtx context.Context, configFiles []string, supervised bool, supervisedLoggingLevel string, supervisedMonitoringURL string) error {
-	settings, err := prepareCollectorSettings(configFiles, supervised, supervisedLoggingLevel)
+func RunCollector(cmdCtx context.Context, configFiles []string, supervised bool, supervisedLoggingLevel string, supervisedMonitoringURL string, componentsFn func() (otelcol.Factories, error)) error {
+	if supervised {
+		// Agent-generated configs pass the override to each Beat receiver through its native
+		// hostname setting. Set the process-wide value before OTel constructs processors so
+		// they observe the same hostname. Standalone collectors own their receiver config and
+		// should use the native hostname setting directly.
+		initBeatHostnameFromEnv()
+	}
+
+	settings, err := prepareCollectorSettings(configFiles, supervised, supervisedLoggingLevel, componentsFn)
 	if err != nil {
 		return fmt.Errorf("failed to prepare collector settings: %w", err)
 	}
@@ -136,15 +150,13 @@ type edotSettings struct {
 	otelSettings *otelcol.CollectorSettings
 }
 
-func prepareCollectorSettings(configFiles []string, supervised bool, supervisedLoggingLevel string) (edotSettings, error) {
+func prepareCollectorSettings(configFiles []string, supervised bool, supervisedLoggingLevel string, componentsFn func() (otelcol.Factories, error)) (edotSettings, error) {
 	var settings edotSettings
-	conf := map[string]any{
-		"endpoint": paths.DiagnosticsExtensionSocket(),
+	baseOpts := []edotOtelCol.SettingOpt{
+		edotOtelCol.WithComponents(componentsFn),
 	}
 	if supervised {
-		settings.otelSettings = edotOtelCol.NewSettings(release.Version(), configFiles,
-			edotOtelCol.WithConfigConvertorFactory(manager.NewForceExtensionConverterFactory(elasticdiagnostics.DiagnosticsExtensionID.String(), conf)),
-		)
+		settings.otelSettings = edotOtelCol.NewSettings(release.Version(), configFiles, baseOpts...)
 
 		// setup logger
 		defaultCfg := logger.DefaultLoggingConfig()
@@ -181,7 +193,7 @@ func prepareCollectorSettings(configFiles []string, supervised bool, supervisedL
 
 		settings.otelSettings.DisableGracefulShutdown = false
 	} else {
-		settings.otelSettings = edotOtelCol.NewSettings(release.Version(), configFiles, edotOtelCol.WithConfigConvertorFactory(manager.NewForceExtensionConverterFactory(elasticdiagnostics.DiagnosticsExtensionID.String(), conf)))
+		settings.otelSettings = edotOtelCol.NewSettings(release.Version(), configFiles, baseOpts...)
 	}
 	return settings, nil
 }

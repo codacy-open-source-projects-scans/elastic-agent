@@ -23,6 +23,263 @@ Known issues are significant defects or limitations that may impact your impleme
 % Workaround description.
 % :::
 
+:::{dropdown} Elastic Agent crash-loop when a remote Elasticsearch monitoring output is configured.
+
+**Applies to: {{agent}} 9.4.6, 9.5.3**
+
+On August 28, 2026, a known issue was discovered where {{agent}} can enter a crash-restart loop immediately after startup
+or after a policy update when the agent policy is configured to use a remote {{es}} output .
+The {{agent}} crashes with:
+
+```shell
+panic: runtime error: index out of range [-1] in diagnostics.addSecretMarkers and exits with status INVALIDARGUMENT
+```
+making {{agent}} unreachable. A fix will be included in {{agent}} 9.4.7 and 9.5.4.
+
+**Workaround**
+
+In {{fleet}}, navigate to the affected agent policy and change the Output for agent monitoring from the remote {{es}}
+output to the local (default) {{es}} output. This prevents the corrupted policy from being generated.
+
+For agents already stuck in a crash loop, stop the agent service and delete `state.enc` from the {{agent}} `data` directory,
+then restart. Restarting clears the corrupted state without requiring re-enrollment.
+
+For more information, check [Issue #7739](https://github.com/elastic/fleet-server/issues/7739).
+:::
+
+::::{dropdown} Kafka Kerberos authentication is dropped when using the OTel runtime
+
+**Applies to: {{agent}} 9.4.0 to 9.4.5, 9.5.0 to 9.5.1**
+
+On August 10, 2026, a known issue was discovered where Kafka outputs configured with Kerberos authentication do not fall back to the process runtime. The OTel runtime starts successfully but silently drops Kerberos settings during config translation, so Kafka authentication fails. A fix will be included in {{agent}} 9.4.6 and 9.5.2.
+
+**Workaround**
+
+Force the process runtime for Kafka outputs:
+
+```yaml
+agent.internal.runtime.output:
+  kafka: process
+```
+
+Alternatively, set `_runtime_experimental: process` on the affected inputs.
+
+For more information, check [Issue #16118](https://github.com/elastic/elastic-agent/issues/16118).
+::::
+
+:::{dropdown} GCP integration data collected through Pub/Sub is silently dropped on the OTel runtime
+
+**Applies to: {{agent}} 9.5.0 to 9.5.1**
+
+On August 5, 2026, a known issue was discovered where the Filebeat OTel runtime converts values with the Go type `map[string]string` to the string `unknown type: map[string]string` instead of an object. When the destination data stream maps the field as an object, {{es}} rejects the document with a `document_parsing_exception`.
+
+The GCP Pub/Sub input uses a `map[string]string` value for the top-level `labels` field. As a result, this issue affects all GCP integration data streams collected through Pub/Sub, including `gcp.audit`, `gcp.vpcflow`, and `gcp.firewall`.
+
+**Symptoms**
+
+{{fleet}} reports the {{agent}} status as **Healthy**, and agent logs do not contain related errors. The Pub/Sub subscription consumes and acknowledges messages, so no backlog appears. If the destination data stream has the Failure Store enabled, the rejected documents are redirected there and the bulk response reports success. The only visible symptom is that no new documents are searchable.
+
+**Workaround**
+
+Force Filebeat to use the process runtime instead of the OTel runtime:
+
+```yaml
+agent:
+  internal.runtime.filebeat.default: process
+```
+
+**Resolution**
+
+Upgrade to {{agent}} 9.5.2 or later.
+
+For more information, check [Issue #52460](https://github.com/elastic/beats/issues/52460).
+:::
+
+:::{dropdown} Osquery live and scheduled query results are missing in Kibana on {{agent}} 9.5.0
+
+**Applies to: {{agent}} 9.5.0**
+
+On August 3, 2026, a known issue was confirmed where {{agent}} 9.5.0 running the `osquery_manager` integration (version 1.30 or later) with default settings causes live and scheduled query results to not appear in the Kibana Osquery UI. Queries appear stuck in "pending" status and the Results column shows 0.
+
+The issue occurs because the OTel runtime, which is the default runtime for Osquerybeat in {{agent}} 9.5, incorrectly routes action response documents to the `osquery_manager.query_profile` data stream instead of `osquery_manager.action.responses`. This only affects agents using a three-stream `osquery_manager` policy, which is the default for newly created policies with `osquery_manager` 1.30 or later.
+
+Agents using policies created before osquery_manager 1.30 added the `query_profile` data stream are not affected.
+
+**Workaround**
+
+Pin Osquerybeat back to the process runtime on the {{fleet}} agent policy using the `osquery_manager` integration:
+
+1. In {{kib}}, go to **Fleet > Agent policies** and open the agent policy.
+
+2. On the **Settings** tab, expand **Advanced settings** and locate **Advanced internal YAML settings**.
+
+3. Enter the following, then select **Save changes**:
+
+    ```yaml
+    runtime:
+      osquerybeat:
+        default: process
+    ```
+
+For more information, check [Issue #15964](https://github.com/elastic/elastic-agent/issues/15964).
+:::
+
+::::{dropdown} {{agent}} Synthetics browser monitors fail on private locations on 9.5.0
+
+**Applies to: {{agent}} 9.5.0**
+
+**Do not upgrade private location {{agents}} that run Synthetics browser (journey) monitors to 9.5.0.** Keep those agents on **9.4.x** (for example 9.4.4) and wait for **9.5.1**. It is supported to run an older {{agent}} version (such as 9.4.4) against a 9.5.0 {{stack}}. Lightweight monitors (HTTP, TCP, and ICMP) and Elastic-managed locations are not affected.
+
+On 9.5.0, browser monitors on {{fleet}}-managed private locations fail for two independent reasons:
+
+1. **Missing Playwright browser binaries** in the `elastic-agent-complete` image. Journeys fail at launch with `browserType.launch: Executable doesn't exist at .../chromium_headless_shell-<rev>/...`. For more information, check [Issue #15993](https://github.com/elastic/elastic-agent/issues/15993).
+
+2. **OTel Heartbeat runtime** rejects browser monitor config and reports the component as permanently failed with `missing required field accessing 'heartbeat.monitors.0.schedule'`. For more information, check [Issue #15968](https://github.com/elastic/elastic-agent/issues/15968).
+
+Both issues are addressed in 9.5.1. There is no supported workaround on 9.5.0 that restores browser monitors without changing the agent version.
+::::
+
+:::{dropdown} {{agent}} restarts repeatedly in containers after a {{fleet}} policy update
+
+**Applies to: {{agent}} 9.3.7, 9.3.8, 9.4.3, 9.4.4**
+
+On July 9, 2026, a known issue was discovered where {{agent}} can restart repeatedly when it is deployed in a {{fleet}}-managed container. When it processes a policy update, the agent uses the default logging values instead of the configuration already active in the container. It incorrectly detects a logging change, restarts and repeats this process indefinitely.
+
+This restart does not increment the container restart count. On Linux, the agent replaces its own process image in place (`execve`), so the PID and container stay alive while the agent loops. Confirm the issue by counting the initialization banner in the agent logs — a healthy agent prints it once, a looping agent prints it tens or hundreds of times within minutes:
+
+```bash
+grep -c 'agent container initialisation - chown paths' <agent-container-logs>
+```
+
+**Workaround**
+
+Update the agent policy to set `agent.logging.to_stderr` to `true` and `agent.logging.to_files` to `false`, so the policy matches the container's logging configuration. Use the {{fleet}} API to apply these settings:
+
+```bash
+curl -u <user>:<password> \
+  -X PUT https://<kibana-host>/api/fleet/agent_policies/<policy-id> \
+  -H 'Content-Type: application/json' \
+  -H 'kbn-xsrf: true' \
+  -d '{
+    "name": "<policy-name>",
+    "namespace": "<policy-namespace>",
+    "overrides": {
+      "agent": {
+        "logging": {
+          "to_stderr": true,
+          "to_files": false
+        }
+      }
+    }
+  }'
+```
+
+The `name` and `namespace` values are required by the API and must match the existing policy. Retrieve them first with a GET request to `/api/fleet/agent_policies/<policy-id>`.
+
+After updating the policy, clear the agent state to break the loop. An agent already looping replays the cached policy action faster than a {{fleet}} check-in interval, so the corrected policy never reaches it. Clear the state by removing `/usr/share/elastic-agent/state/fleet.yml` — from inside the running container, from the mounted volume on the host, or by recreating the container. Alternatively, set the `FLEET_FORCE=1` environment variable and restart to force re-enrollment regardless of existing state.
+
+**Alternative workaround**
+
+Instead of updating the agent policy with the API call, you can prevent the loop from occurring by setting the `LOGS_PATH` environment variable on the container before it starts. This stops the container entrypoint from injecting a logging configuration, so no mismatch between the container and the policy can occur. Note that when `LOGS_PATH` is set, agent logs are written to files rather than stderr.
+
+For more information, check [Issue #15432](https://github.com/elastic/elastic-agent/issues/15432).
+:::
+
+:::{dropdown} {{agent}} logs a "failed to unmarshal checkin actions" error on almost every {{fleet}} check-in
+
+**Applies to: {{agent}} 8.19.17, 8.19.18, 9.3.6, 9.3.7, 9.4.3**
+
+On July 7, 2026, a known issue was discovered where {{fleet}}-managed {{agents}} log an error on nearly every check-in when there is nothing new for {{fleet}} to tell them to do:
+
+```
+failed to unmarshal checkin actions: unexpected end of JSON input
+```
+
+This is a cosmetic logging issue only. Actions are still delivered and processed normally whenever {{fleet}} does send any. Nothing about how the agent actually operates is affected, and no action is required — the error can be safely ignored.
+
+For more information, check [Issue #15397](https://github.com/elastic/elastic-agent/issues/15397).
+:::
+
+:::{dropdown} [Windows] {{agent}} fails to upgrade when the host has 100 or more installed programs
+
+**Applies to: {{agent}} 9.4.0, 9.4.1, 9.4.2 (Windows only)**
+
+On June 4, 2026, a known issue was discovered where upgrading {{agent}} from a pre-9.4.0 version on a Windows host with 100 or more entries in Add/Remove Programs causes the new agent to hang indefinitely during startup. The Upgrade Watcher detects the hang and rolls back the upgrade.
+
+To check the number of entries on a host, run the following command in PowerShell:
+
+```powershell
+(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall').Count
+```
+
+If the count is more than 100, upgrade directly to a version that is not affected by this issue.
+
+For more information, check [Issue #14764](https://github.com/elastic/elastic-agent/issues/14764).
+:::
+
+:::{dropdown} Missing APM service_destination metrics and empty service map in the APM UI
+
+**Applies to: {{agent}} 9.2.6, 9.2.7, 9.3.1, 9.3.2**
+
+On June 17, 2026, a known issue was discovered where the aggregated `service_destination` metric that the APM UI uses can be missing from the `metrics/aggregated-otel-metrics` EDOT Collector pipeline, even when trace traffic is present and other telemetry paths appear healthy. As a result, the APM service map appears empty.
+
+The issue occurs when two EDOT components, `elasticapmprocessor` and `elasticapmconnector`, are both at v0.29.0, which is the version bundled with the affected {{agent}} releases.
+
+**Resolution**
+
+This issue is fixed in {{agent}} 9.2.8 and 9.3.3, which include updated versions of these components.
+
+For more information, check [Issue #14964](https://github.com/elastic/elastic-agent/issues/14964).
+:::
+
+:::{dropdown} Elastic Agent reports policy is outdated when agent.features.disable_policy_change_acks is enabled.
+**Applies to: {{agent}} 9.4.0, 9.3.4, 9.3.3, 9.3.2, 9.3.1, 9.3.0, 9.2.7, 9.2.6, 9.2.5, 9.2.4, 9.2.3, 9.2.2, 9.2.1, 9.2.0**
+
+On April 22, 2026 a known issue was discovered that prevents {{fleet}}-managed {{agents}} from correctly reporting their policy information when policy change acknowledgements are disabled.
+
+Users see an outdated policy warning on the {{fleet}} UI when policy change acknowledgments are disabled and a policy update is sent.
+
+**Workaround:**
+
+Affected users can uncheck the **Disable policy change acknowledgments** option within the agent policy settings in the Fleet UI.
+
+For more information check [Issue #264983](https://github.com/elastic/kibana/issues/264983).
+:::
+
+::::{dropdown} Events from Beats-based inputs and integrations in Elastic Agent 9.3.4 incorrectly convert timestamps to an empty {} JSON object.
+:name: events-beats-9-3-4-timestamp-empty-object
+**Applies to: {{agent}} 9.3.4**
+
+:::{warning}
+Due to the broad impact of this issue, {{agent}} 9.3.4 has been removed from the downloads page. We recommend upgrading directly to {{agent}} 9.3.5 or later.
+:::
+
+A performance optimization in {{agent}} 9.3.4 causes timestamp fields produced by Beats-based inputs to be incorrectly serialized as an empty `{}` JSON object. This affects time fields in the event body (for example, `event.created`) but does not affect the primary `@timestamp` field.
+
+**Impact**
+
+Because most {{agent}} integrations and inputs rely on Beats-based collectors, the impact is wide-ranging. Examples of affected functionality include:
+
+* **Synthetics monitoring** — Synthetics monitors rely on Heartbeat and might stop reporting expected data, resulting in a loss of monitoring visibility.
+* **SentinelOne integration** — Response actions stop functioning when `event.created` is missing. For details, refer to [Issue #266355](https://github.com/elastic/kibana/issues/266355).
+* **Other data-collection integrations** — Any integration that sends events through Beats-based inputs may emit affected documents.
+
+**Symptoms**
+
+Documents from Beats-based inputs contain one or more time fields serialized as an empty object, for example:
+
+```json
+"event": {
+  "dataset": "sentinel_one.agent",
+  "created": {}
+}
+```
+
+**Resolution**
+
+The performance optimization has been removed. The fix is included in {{agent}} 9.3.5. This issue does not affect {{agent}} 9.4.0.
+::::
+
 :::{dropdown} Elastic Agent 9.3.x fails to start on MacOS when OSQuery Manager integration is used
 **Applies to: {{agent}} 9.3.0, 9.3.1**
 
@@ -139,9 +396,10 @@ This issue is triggered if the upgrade fails during one of the early checks insi
 Restart the {{agent}} to clear the coordinator’s `overrideState` and allow new upgrade attempts to proceed.
 
 **Resolution**
+
 This issue was fixed in [#9992](https://github.com/elastic/elastic-agent/pull/9992), which ensures that the coordinator clears its override state whenever an early failure occurs.
 
-The fix is included in versions 9.1.4 and 8.19.4, and planned for versions 9.0.8 and 8.18.8.
+The fix is included in versions 9.1.4, 9.0.8, 8.19.4, and 8.18.8.
 :::
 
 :::{dropdown} [Windows] {{agent}} does not process Windows security events
@@ -152,9 +410,9 @@ On August 1, 2025, a known issue was discovered where {{agent}} does not process
 
 For more information, check [Issue #45693](https://github.com/elastic/beats/issues/45693).
 
-**Workaround**
+**Resolution**
 
-No workaround is available at the moment, but a fix is expected to be available in {{agent}} 8.19.1 and 9.1.1.
+This issue was fixed in [#45730](https://github.com/elastic/beats/pull/45730). The fix is included in {{agent}} 9.1.1 and 8.19.1.
 :::
 
 :::{dropdown} {{agents}} remain in an "Upgrade scheduled" state

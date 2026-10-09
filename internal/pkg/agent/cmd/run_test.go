@@ -5,19 +5,29 @@
 package cmd
 
 import (
+	"context"
 	_ "embed"
+	"flag"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 
 	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/enroll"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
+	"github.com/elastic/elastic-agent/internal/pkg/config"
 	monitoringCfg "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
+	"github.com/elastic/elastic-agent/internal/pkg/testutils"
+	"github.com/elastic/elastic-agent/pkg/core/logger"
 )
 
 var (
@@ -148,9 +158,97 @@ func TestRunLoadConfig(t *testing.T) {
 			err := os.WriteFile(filepath.Join(dir, paths.DefaultConfigName), tt.file, 0o644)
 			require.NoError(t, err)
 
-			cfg, err := loadConfig(t.Context(), nil)
+			reloader, err := configuration.NewConfigReloader(t.Context(), nil, nil)
 			require.NoError(t, err)
-			require.Equal(t, tt.expect(), cfg)
+			cfg := reloader.Configuration()
+			require.Equal(t, tt.expect().Fleet.Enabled, cfg.Fleet.Enabled)
+			require.Equal(t, tt.expect().Settings.LoggingConfig, cfg.Settings.LoggingConfig)
 		})
+	}
+}
+
+func TestCustomLogsPathCfgOverride(t *testing.T) {
+	const customPath = "/tmp/custom-logs"
+
+	paths.SetupFlags()
+	origLogsPath := paths.Logs()
+	t.Cleanup(func() {
+		require.NoError(t, flag.CommandLine.Set("path.logs", ""))
+		paths.SetLogs(origLogsPath)
+	})
+	require.NoError(t, flag.CommandLine.Set("path.logs", customPath))
+
+	rawCfg, err := config.NewConfigFrom(map[string]any{
+		"agent": map[string]any{
+			"logging": map[string]any{
+				"to_stderr": true,
+				"event_data": map[string]any{
+					"to_stderr": true,
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, customLogsPathCfgOverride(rawCfg))
+
+	cfg, err := configuration.NewFromConfig(rawCfg)
+	require.NoError(t, err)
+	assert.False(t, cfg.Settings.LoggingConfig.ToStderr)
+	assert.True(t, cfg.Settings.LoggingConfig.ToFiles)
+	assert.Equal(t, customPath, cfg.Settings.LoggingConfig.Files.Path)
+	assert.False(t, cfg.Settings.EventLoggingConfig.ToStderr)
+	assert.True(t, cfg.Settings.EventLoggingConfig.ToFiles)
+}
+
+func TestTryDelayEnroll_ExitsOnCtxCancel(t *testing.T) {
+	testutils.InitStorage(t)
+
+	origCfgDir := paths.Config()
+	t.Cleanup(func() { paths.SetConfig(origCfgDir) })
+	paths.SetConfig(t.TempDir())
+
+	// Reply with 503 on every request so the agent keeps retrying enrollment.
+	gotRequest := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case gotRequest <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	enrollContents, err := yaml.Marshal(&enroll.EnrollOptions{
+		URL:          server.URL,
+		EnrollAPIKey: "fake-token",
+		Insecure:     true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(paths.AgentEnrollFile(), enrollContents, 0o600))
+
+	log := logger.NewWithoutConfig("")
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tryDelayEnroll(ctx, log)
+	}()
+
+	// Wait until the agent has actually started trying to enroll before
+	// cancelling, so we know the retry loop is running.
+	select {
+	case <-gotRequest:
+	case <-time.After(10 * time.Second):
+		t.Fatal("server never received an enrollment request")
+	}
+	cancel()
+
+	// After cancel, tryDelayEnroll should return promptly with context.Canceled.
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(10 * time.Second):
+		t.Fatal("tryDelayEnroll did not exit after ctx cancel")
 	}
 }

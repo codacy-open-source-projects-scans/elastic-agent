@@ -7,7 +7,6 @@
 package ess
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -36,8 +35,8 @@ func TestRestrictUpgradeDeb(t *testing.T) {
 			},
 		},
 	})
-	t.Run("when agent is deployed via deb, a user should not be able to upgrade the agent using the cli", func(t *testing.T) {
-		ctx := context.Background()
+	t.Run("when agent is deployed via deb, it does not upgrade or start rollback cleanup", func(t *testing.T) {
+		ctx := t.Context()
 
 		fixture, err := define.NewFixtureFromLocalBuild(t, define.Version(), atesting.WithPackageFormat("deb"))
 		require.NoError(t, err)
@@ -69,5 +68,6 @@ func TestRestrictUpgradeDeb(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, string(out), coordinator.ErrNotUpgradable.Error())
 
+		assertPeriodicRollbackCleanupNotStarted(t, ctx, fixture)
 	})
 }

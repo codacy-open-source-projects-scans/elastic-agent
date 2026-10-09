@@ -8,18 +8,18 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime/pprof"
 	"strings"
 	"time"
 
+	"github.com/elastic/elastic-agent-libs/redact"
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/go-ucfg"
@@ -35,12 +35,18 @@ import (
 
 const (
 	// ContentTypeDirectory should be used to indicate that a directory should be made in the resulting bundle
-	ContentTypeDirectory = "directory"
-	// REDACTED is used to replace sensative fields
-	REDACTED          = "<REDACTED>"
-	REDACTED_URL_SAFE = "REDACTED"
-	agentName         = "elastic-agent"
+	ContentTypeDirectory  = "directory"
+	agentName             = "elastic-agent"
+	redactionMarkerPrefix = "__mark_redact_"
+	redactionRouteKey     = "routekey"
 )
+
+var redactionHeaderValueKeys = []string{
+	"FLEET_HEADER",
+	"FLEET_HEADERS",
+	"FLEET_KIBANA_HEADER",
+	"FLEET_KIBANA_HEADERS",
+}
 
 // DiagCPU* are contstants to describe the CPU profile that is collected when the --cpu-profile flag is used with the diagnostics command, or the diagnostics action contains "CPU" in the additional_metrics list.
 const (
@@ -75,7 +81,7 @@ func GlobalHooks() Hooks {
 				v := release.Info()
 				o, err := yaml.Marshal(v)
 				if err != nil {
-					return []byte(fmt.Sprintf("error: %q", err))
+					return fmt.Appendf(nil, "error: %q", err)
 				}
 				return o
 			},
@@ -88,11 +94,11 @@ func GlobalHooks() Hooks {
 			Hook: func(_ context.Context) []byte {
 				pkgVersionPath, err := version.GetAgentPackageVersionFilePath()
 				if err != nil {
-					return []byte(fmt.Sprintf("error: %q", err))
+					return fmt.Appendf(nil, "error: %q", err)
 				}
 				fileBytes, err := os.ReadFile(pkgVersionPath)
 				if err != nil {
-					return []byte(fmt.Sprintf("error: %q", err))
+					return fmt.Appendf(nil, "error: %q", err)
 				}
 				return fileBytes
 			},
@@ -103,13 +109,13 @@ func GlobalHooks() Hooks {
 			Description: "Environment variables",
 			ContentType: "application/yaml",
 			Hook: func(_ context.Context) []byte {
-				redacted, err := redactEnv()
+				redacted, err := RedactEnv()
 				if err != nil {
 					return []byte(err.Error())
 				}
 				out, err := yaml.Marshal(redacted)
 				if err != nil {
-					return []byte(fmt.Sprintf("Unable to marshall env vars into yaml: %v", err))
+					return fmt.Appendf(nil, "Unable to marshall env vars into yaml: %v", err)
 				}
 				return out
 			},
@@ -165,7 +171,7 @@ func pprofDiag(name string, debug int) func(context.Context) []byte {
 		err := pprof.Lookup(name).WriteTo(&w, debug)
 		if err != nil {
 			// error is returned as the content
-			return []byte(fmt.Sprintf("failed to write pprof to bytes buffer: %s", err))
+			return fmt.Appendf(nil, "failed to write pprof to bytes buffer: %s", err)
 		}
 		return w.Bytes()
 	}
@@ -284,6 +290,9 @@ func ZipArchive(
 			// check for component-level errors
 			// create unit diags
 			for _, ud := range units {
+				if ud.Err == nil && len(ud.Results) == 0 {
+					continue
+				}
 				unitDir := strings.ReplaceAll(strings.TrimPrefix(ud.UnitID, ud.ComponentID+"-"), "/", "-")
 				_, err := zw.CreateHeader(&zip.FileHeader{
 					Name:     fmt.Sprintf("components/%s/%s/", dirName, unitDir),
@@ -321,7 +330,7 @@ func ZipArchive(
 	}
 
 	// Gather Logs:
-	return zipLogs(zw, ts, topPath, excludeEvents)
+	return zipLogs(zw, ts, topPath, paths.Components(), excludeEvents, errOut)
 }
 
 func writeErrorResult(zw *zip.Writer, path string, errBody string) error {
@@ -342,163 +351,100 @@ func writeErrorResult(zw *zip.Writer, path string, errBody string) error {
 	return nil
 }
 
+// RedactOpts returns a slice of RedactOptions with the error output set to w, skip keys set, and marker prefixes set
+func RedactOpts(w io.Writer) []redact.RedactOption {
+	return []redact.RedactOption{
+		redact.WithErrorOutput(w),
+		redact.WithMarkerPrefix(redactionMarkerPrefix),
+		redact.WithIgnoreKeys(redactionRouteKey),
+		redact.WithHeaderValueKeys(redactionHeaderValueKeys...),
+	}
+}
+
 func writeRedacted(errOut, resultWriter io.Writer, fullFilePath string, fileResult client.DiagnosticFileResult) error {
 	out := &fileResult.Content
 
-	// Should we support json too?
-	if fileResult.ContentType == "application/yaml" {
-		var unmarshalled any
-		err := yaml.Unmarshal(fileResult.Content, &unmarshalled)
+	var (
+		unmarshalled any
+		marshal      func(any) ([]byte, error)
+		err          error
+	)
+
+	switch fileResult.ContentType {
+	case "application/yaml":
+		err = yaml.Unmarshal(fileResult.Content, &unmarshalled)
+		marshal = yaml.Marshal
+	case "application/json":
+		decoder := json.NewDecoder(bytes.NewReader(fileResult.Content))
+		decoder.UseNumber()
+		err = decoder.Decode(&unmarshalled)
+		marshal = func(value any) ([]byte, error) {
+			return json.MarshalIndent(value, "", "  ")
+		}
+	default:
+		_, err = resultWriter.Write(*out)
+		return err
+	}
+
+	if err != nil {
+		// Best effort, output a warning but still include the file
+		fmt.Fprintf(errOut, "[WARNING] Could not redact %s due to unmarshalling error: %s\n", fullFilePath, err)
+	} else {
+		// Only redact structured diagnostic content, leaving plain text unchanged.
+		switch unmarshalled.(type) {
+		case map[string]any, []any:
+		default:
+			_, err = resultWriter.Write(*out)
+			return err
+		}
+
+		// Redact accepts a map, so wrap the value to support top-level arrays.
+		wrapped := map[string]any{"content": unmarshalled}
+		redact.Redact(wrapped, RedactOpts(errOut)...)
+		redacted, err := marshal(wrapped["content"])
 		if err != nil {
 			// Best effort, output a warning but still include the file
-			fmt.Fprintf(errOut, "[WARNING] Could not redact %s due to unmarshalling error: %s\n", fullFilePath, err)
+			fmt.Fprintf(errOut, "[WARNING] Could not redact %s due to marshalling error: %s\n", fullFilePath, err)
 		} else {
-			switch t := unmarshalled.(type) { // could be a plain string, we only redact if this is a proper map
-			case map[string]any:
-				t = Redact(t, errOut)
-				redacted, err := yaml.Marshal(t)
-				if err != nil {
-					// Best effort, output a warning but still include the file
-					fmt.Fprintf(errOut, "[WARNING] Could not redact %s due to marshalling error: %s\n", fullFilePath, err)
-				} else {
-					out = &redacted
-				}
-			default:
-			}
+			out = &redacted
 		}
 	}
 
-	_, err := resultWriter.Write(*out)
+	_, err = resultWriter.Write(*out)
 	return err
 }
 
-const redactionMarkerPrefix = "__mark_redact_"
-
-// redactMap sensitive values from the underlying map
-// the whole generic function here is out of paranoia. Although extremely unlikely,
-// we have no way of guaranteeing we'll get a "normal" map[string]interface{},
-// since the diagnostic interface is a bit of a free-for-all
-func redactMap[K comparable](errOut io.Writer, inputMap map[K]interface{}) map[K]interface{} {
-	if inputMap == nil {
-		return nil
-	}
-
-	redactionMarkers := []string{}
-	for rootKey, rootValue := range inputMap {
-		if rootValue != nil {
-			switch cast := rootValue.(type) {
-			case map[string]interface{}:
-				rootValue = redactMap(errOut, cast)
-			case map[interface{}]interface{}:
-				rootValue = redactMap(errOut, cast)
-			case map[int]interface{}:
-				rootValue = redactMap(errOut, cast)
-			case []interface{}:
-				newArray := make([]interface{}, len(cast))
-				// Recursively process each element in the slice so that we also walk
-				// through lists (e.g. inputs[4].streams[0]). This is required to
-				// reach redaction markers that are inside slice items. Set SliceElem to true
-				// to avoid global redaction of slice elements.
-				for i, value := range cast {
-					switch m := value.(type) {
-					case map[string]interface{}:
-						newArray[i] = redactMap(errOut, m)
-					case map[interface{}]interface{}:
-						newArray[i] = redactMap(errOut, m)
-					case map[int]interface{}:
-						newArray[i] = redactMap(errOut, m)
-					case string:
-						if redactedValue, redact := redactString(m); redact {
-							newArray[i] = redactedValue
-						} else {
-							newArray[i] = m
-						}
-					default:
-						newArray[i] = value
-					}
-				}
-				rootValue = newArray
-			case string:
-				if keyString, ok := any(rootKey).(string); ok && redactKey(keyString) {
-					rootValue = REDACTED
-				} else if redactedValue, redact := redactString(cast); redact {
-					rootValue = redactedValue
-				}
-			case bool: // redaction marker values are always going to be bool, process redaction markers in this case
-				if keyString, ok := any(rootKey).(string); ok {
-					// Find siblings that have the redaction marker.
-					if strings.HasPrefix(keyString, redactionMarkerPrefix) {
-						redactionMarkers = append(redactionMarkers, keyString)
-						delete(inputMap, rootKey)
-					}
-				}
-			default:
-				// in cases where we got some weird kind of map we couldn't parse, print a warning
-				if reflect.TypeOf(rootValue).Kind() == reflect.Map {
-					fmt.Fprintf(errOut, "[WARNING]: file may be partly redacted, could not cast value %v of type %T", rootKey, rootValue)
-				}
-
-			}
-		}
-		inputMap[rootKey] = rootValue
-	}
-
-	for _, redactionMarker := range redactionMarkers {
-		keyToRedact := strings.TrimPrefix(redactionMarker, redactionMarkerPrefix)
-		for rootKey := range inputMap {
-			if keyString, ok := any(rootKey).(string); ok {
-				if keyString == keyToRedact {
-					inputMap[rootKey] = REDACTED
-				}
-
-				if keyString == redactionMarker {
-					delete(inputMap, rootKey)
-				}
-			}
-		}
-	}
-
-	return inputMap
-}
-
-func redactKey(k string) bool {
-	// "routekey" shouldn't be redacted.
-	// Add any other exceptions here.
-	if k == "routekey" {
-		return false
-	}
-
-	k = strings.ToLower(k)
-	return strings.Contains(k, "auth") ||
-		strings.Contains(k, "certificate") ||
-		strings.Contains(k, "passphrase") ||
-		strings.Contains(k, "password") ||
-		strings.Contains(k, "token") ||
-		strings.Contains(k, "key") ||
-		strings.Contains(k, "secret")
-}
-
-// This currently only redacts credentials embedded in URLs, but if we find other patterns of sensitive strings in the future we can add them here
-func redactString(v string) (string, bool) {
-	u, err := url.Parse(v)
-
-	if err != nil || u.User == nil {
-		return v, false
-	}
-
-	u.User = url.UserPassword(REDACTED_URL_SAFE, REDACTED_URL_SAFE)
-
-	return u.String(), true
-}
-
-func zipLogs(zw *zip.Writer, ts time.Time, topPath string, excludeEvents bool) error {
+func zipLogs(zw *zip.Writer, ts time.Time, topPath string, componentsPath string, excludeEvents bool, errOut io.Writer) error {
 	homePath := paths.HomeFrom(topPath)
 	dataPath := paths.DataFrom(topPath)
 	currentDir := filepath.Base(homePath)
+
+	_, err := zw.CreateHeader(&zip.FileHeader{
+		Name:     "logs/",
+		Method:   zip.Deflate,
+		Modified: ts,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := collectServiceComponentsLogs(zw, errOut); err != nil {
+		fmt.Fprintf(errOut, "[WARNING] failed to collect endpoint-security logs: %s\n", err)
+	}
+
 	if !paths.IsVersionHome() {
 		// running in a container with custom top path set
 		// logs are directly under top path
-		return zipLogsWithPath(homePath, currentDir, true, excludeEvents, zw, ts)
+		if err := zipLogsWithPath(homePath, currentDir, excludeEvents, zw, ts, errOut); err != nil {
+			return err
+		}
+		// Components run from the install tree, which is a different directory than topPath
+		// when a custom state path is set, so it needs its own walk.
+		installHome := filepath.Dir(componentsPath)
+		if installHome == homePath {
+			return nil
+		}
+		return zipLogsWithPath(installHome, filepath.Base(installHome), excludeEvents, zw, ts, errOut)
 	}
 
 	dataDir, err := os.Open(dataPath)
@@ -517,9 +463,8 @@ func zipLogs(zw *zip.Writer, ts time.Time, topPath string, excludeEvents bool) e
 		if !strings.HasPrefix(dir, dirPrefix) {
 			continue
 		}
-		collectServices := dir == currentDir
 		path := filepath.Join(dataPath, dir)
-		if err := zipLogsWithPath(path, dir, collectServices, excludeEvents, zw, ts); err != nil {
+		if err := zipLogsWithPath(path, dir, excludeEvents, zw, ts, errOut); err != nil {
 			return err
 		}
 	}
@@ -527,40 +472,53 @@ func zipLogs(zw *zip.Writer, ts time.Time, topPath string, excludeEvents bool) e
 	return nil
 }
 
-// zipLogs walks paths.Logs() and copies the file structure into zw in "logs/"
-func zipLogsWithPath(pathsHome, commitName string, collectServices, excludeEvents bool, zw *zip.Writer, ts time.Time) error {
-	_, err := zw.CreateHeader(&zip.FileHeader{
-		Name:     "logs/",
-		Method:   zip.Deflate,
-		Modified: ts,
-	})
-	if err != nil {
-		return err
-	}
-
-	if collectServices {
-		if err := collectServiceComponentsLogs(zw); err != nil {
-			return fmt.Errorf("failed to collect endpoint-security logs: %w", err)
-		}
-	}
-
-	_, err = zw.CreateHeader(&zip.FileHeader{
+// zipLogsWithPath walks {pathsHome}/logs and {pathsHome}/components/logs and copies them into zw
+// under "logs/<commitName>/" and "logs/<commitName>/components/" respectively.
+func zipLogsWithPath(pathsHome, commitName string, excludeEvents bool, zw *zip.Writer, ts time.Time, errOut io.Writer) error {
+	if _, err := zw.CreateHeader(&zip.FileHeader{
 		Name:     "logs/" + commitName + "/",
 		Method:   zip.Deflate,
 		Modified: ts,
-	})
-	if err != nil {
-		return err
+	}); err != nil {
+		return fmt.Errorf("failed to create logs dir entry for %s: %w", commitName, err)
 	}
 
-	// using Data() + "/logs", for some reason default paths/Logs() is the home dir...
-	logPath := filepath.Join(pathsHome, "logs") + string(filepath.Separator)
-	return filepath.WalkDir(logPath, func(path string, d fs.DirEntry, fErr error) error {
+	if err := walkLogPath(filepath.Join(pathsHome, "logs"), commitName, excludeEvents, zw, ts, errOut); err != nil {
+		return fmt.Errorf("failed to collect logs from %s: %w", pathsHome, err)
+	}
+
+	if _, err := zw.CreateHeader(&zip.FileHeader{
+		Name:     "logs/" + commitName + "/components/",
+		Method:   zip.Deflate,
+		Modified: ts,
+	}); err != nil {
+		return fmt.Errorf("failed to create components logs dir entry for %s: %w", commitName, err)
+	}
+
+	// Components may write logs under {pathsHome}/components/logs.
+	// Mirror that structure under logs/<commitName>/components/ to reflect the source layout.
+	if err := walkLogPath(filepath.Join(pathsHome, "components", "logs"), filepath.Join(commitName, "components"), excludeEvents, zw, ts, errOut); err != nil {
+		return fmt.Errorf("failed to collect component logs from %s: %w", pathsHome, err)
+	}
+
+	return nil
+}
+
+func walkLogPath(logRoot, commitName string, excludeEvents bool, zw *zip.Writer, ts time.Time, errOut io.Writer) error {
+	// Trailing separator is required: zipLogWalkFunc uses logPath as a TrimPrefix argument,
+	// so it must end with a separator to avoid a leading slash on relative names.
+	logPath := logRoot + string(filepath.Separator)
+	return filepath.WalkDir(logPath, zipLogWalkFunc(logPath, commitName, excludeEvents, zw, ts, errOut))
+}
+
+func zipLogWalkFunc(logPath, commitName string, excludeEvents bool, zw *zip.Writer, ts time.Time, errOut io.Writer) func(path string, d fs.DirEntry, fErr error) error {
+	return func(path string, d fs.DirEntry, fErr error) error {
 		if errors.Is(fErr, fs.ErrNotExist) {
 			return nil
 		}
 		if fErr != nil {
-			return fmt.Errorf("unable to walk log dir: %w", fErr)
+			fmt.Fprintf(errOut, "[WARNING] unable to walk log dir %s: %s\n", path, fErr)
+			return nil
 		}
 
 		// name is the relative dir/file name replacing any filepath seperators with /
@@ -581,27 +539,21 @@ func zipLogsWithPath(pathsHome, commitName string, collectServices, excludeEvent
 		name = filepath.Join(commitName, name)
 
 		if d.IsDir() {
-			_, err := zw.CreateHeader(&zip.FileHeader{
+			if _, err := zw.CreateHeader(&zip.FileHeader{
 				Name:     "logs/" + filepath.ToSlash(name) + "/",
 				Method:   zip.Deflate,
 				Modified: ts,
-			})
-			if err != nil {
-				return fmt.Errorf("unable to create log directory in archive: %w", err)
+			}); err != nil {
+				return fmt.Errorf("unable to create log directory in archive %s: %w", name, err)
 			}
 			return nil
 		}
 
-		// Add the file to the zip.
-		// Ignore files that don't exist to account for races with log rotation.
-		if err := saveLogs(name, path, zw); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		return nil
-	})
+		return saveLogs(name, path, zw, errOut)
+	}
 }
 
-func collectServiceComponentsLogs(zw *zip.Writer) error {
+func collectServiceComponentsLogs(zw *zip.Writer, errOut io.Writer) error {
 	platform, err := component.LoadPlatformDetail()
 	if err != nil {
 		return fmt.Errorf("failed to gather system information: %w", err)
@@ -635,7 +587,7 @@ func collectServiceComponentsLogs(zw *zip.Writer) error {
 				return nil
 			}
 
-			return saveLogs("services/"+name, path, zw)
+			return saveLogs("services/"+name, path, zw, errOut)
 		})
 		if err != nil {
 			return err
@@ -644,11 +596,19 @@ func collectServiceComponentsLogs(zw *zip.Writer) error {
 	return nil
 }
 
-func saveLogs(name string, logPath string, zw *zip.Writer) error {
+// saveLogs copies the log file at logPath into the zip under "logs/<name>".
+// Source-file errors (file not found, permission denied) are logged as warnings and the
+// function returns nil so the caller can continue collecting other logs.
+// Only zip-writer errors (CreateHeader, io.Copy to the zip) are returned so the caller
+// knows to stop writing to the archive.
+func saveLogs(name string, logPath string, zw *zip.Writer, errOut io.Writer) error {
 	ts := time.Now().UTC()
 	lf, err := os.Open(logPath)
 	if err != nil {
-		return fmt.Errorf("unable to open log file: %w", err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(errOut, "[WARNING] unable to open log file %s: %s\n", logPath, err)
+		}
+		return nil
 	}
 	defer lf.Close()
 	if li, err := lf.Stat(); err == nil {
@@ -663,16 +623,7 @@ func saveLogs(name string, logPath string, zw *zip.Writer) error {
 		return err
 	}
 	_, err = io.Copy(zf, lf)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Redact redacts sensitive values from the passed mapStr.
-func Redact(mapStr map[string]any, errOut io.Writer) map[string]any {
-	return redactMap(errOut, mapStr)
+	return err
 }
 
 // AddSecretMarkers adds secret redaction markers to the config by looking at the secret_paths field.
@@ -743,16 +694,16 @@ func addSecretMarkers(cfg *config.Config, secretPaths []string) error {
 	return aggregateError
 }
 
-func redactEnv() (map[string]any, error) {
+func RedactEnv() (map[string]any, error) {
 	envMap := map[string]any{}
 	for _, e := range os.Environ() {
 		pair := strings.SplitN(e, "=", 2)
 		envMap[pair[0]] = pair[1]
 	}
 	var errOut bytes.Buffer
-	redacted := Redact(envMap, &errOut)
+	redact.Redact(envMap, RedactOpts(&errOut)...)
 	if errOut.Len() > 0 {
 		return nil, errors.New(errOut.String())
 	}
-	return redacted, nil
+	return envMap, nil
 }

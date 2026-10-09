@@ -86,7 +86,7 @@ Refer to [architecture.md](./docs/architecture.md).
 
 ## Packaging and delivery
 
-Build artifacts (for example tar, deb, rpm, Docker images) are produced via mage packaging targets; see `magefile.go` for environment variables such as `EXTERNAL`, `SNAPSHOT`, `PLATFORMS`, `PACKAGES`, `DEV`, `DOCKER_VARIANTS`. Kubernetes-oriented deployment material lives under `deploy/helm/`.
+Build artifacts (for example tar, deb, rpm, Docker images) are produced via mage packaging targets; see the [test framework guide](docs/test-framework-dev-guide.md#packaging) for environment variables such as `AGENT_CORE_SOURCE`, `EXTERNAL` (defaults to `true`), `SNAPSHOT`, `PLATFORMS`, `PACKAGES`, `DEV`, `DOCKER_VARIANTS`. `PACKAGES` is optional and defaults to `tar.gz` on non-Windows and `zip` on Windows; use `PACKAGES=all` to build all package types. Kubernetes-oriented deployment material lives under `deploy/helm/`.
 Produced artifacts will be placed in the `build` directory.
 
 ## Testing
@@ -125,9 +125,8 @@ The repo contains **multiple Go modules**; use **`mage tidy`** to keep `go.mod` 
 ### Lint Commands
 
 ```bash
-mage fmt             # formats source code (.go and .py) and adds license headers.
-mage format:all      # format automatically all the codes.
-mage format:license  # applies the right license header.
+mage fmt               # formats source code (.go and .py) and adds license headers.
+mage addLicenseHeaders # adds license headers without formatting imports.
 ```
 
 ### Rules enforced by tooling
@@ -142,7 +141,7 @@ CI and local checks enforce the following (details in [.golangci.yml](./.golangc
   - **`gomodguard`**: blocked modules (for example deprecated error/uuid libraries) with suggested replacements.
   - **`nolintlint`**: `//nolint` must include an **explanation**.
   - **`gomoddirectives`**: `replace` directives are restricted to an allow list (see config).
-- **Lint scope:** **`mage check:lint`** / **`make lint`** — changed files; **`mage check:lintAll`** / **`make lint-all`** — entire codebase. **`mage check:all`** is separate: license headers, integration-test `define.Require` validation, and docs path validation (see [magefile.go](./magefile.go) `Check.All`).
+- **Lint scope:** **`mage check:lint`** / **`make lint`** — changed files; **`mage check:lintAll`** / **`make lint-all`** — entire codebase. Each runs golangci-lint across multiple build-tag sets so files behind `//go:build` tags (integration, requirefips, mage, …) are linted too (see `buildTagSets` in [dev-tools/mage/lint.go](./dev-tools/mage/lint.go)). **`mage check:all`** is separate: license headers, integration-test `define.Require` validation, and docs path validation (see [magefile.go](./magefile.go) `Check.All`).
 - **Heavy local / CI-style checks:** **`mage check`** (from [dev-tools/mage/target/common/check.go](./dev-tools/mage/target/common/check.go)) runs formatting, registered codegen/update deps (see `init()` in [magefile.go](./magefile.go)), **`mage tidy`**, then **`go vet`** and a clean working tree check. **`make check-ci`** runs **`mage check`**, regenerates **`NOTICE`**, Helm/Kubernetes generation targets, and **`check-no-changes`**. **`make check`** is **`check-ci`** plus **`make lint`** (golangci-lint).
 - **Generated / spec artifacts:** After changing protos, specs, or generated configs, run **`mage update`** (and related targets as described in magefile doc strings). Do not hand-edit generated outputs without regenerating from source.
 - **Docs structure:** **`mage check:all`** includes validation that files expected by docs generation exist (`Check.DocsFiles` in magefile).

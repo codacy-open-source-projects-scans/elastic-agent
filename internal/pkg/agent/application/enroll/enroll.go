@@ -8,11 +8,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	goerrors "errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"os"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -24,19 +25,18 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
-	"github.com/elastic/elastic-agent/internal/pkg/core/backoff"
 	monitoringConfig "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/crypto"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	fleetclient "github.com/elastic/elastic-agent/internal/pkg/fleetapi/client"
 	"github.com/elastic/elastic-agent/internal/pkg/release"
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
+	"github.com/elastic/elastic-agent/pkg/backoff"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
+	pkgfleetapi "github.com/elastic/elastic-agent/pkg/fleetapi"
 )
 
 const (
-	EnrollBackoffInit      = time.Second * 5
-	EnrollBackoffMax       = time.Minute * 10
 	EnrollInfiniteAttempts = -1
 
 	maxRetriesstoreAgentInfo       = 5
@@ -62,7 +62,7 @@ func EnrollWithBackoff(
 ) error {
 	if backoffFactory == nil {
 		backoffFactory = func(done <-chan struct{}) backoff.Backoff {
-			return backoff.NewEqualJitterBackoff(done, EnrollBackoffInit, EnrollBackoffMax)
+			return backoff.NewEqualJitterBackoff(done, pkgfleetapi.EnrollBackoffInit, pkgfleetapi.EnrollBackoffMax)
 		}
 	}
 	delay(ctx, enrollDelay)
@@ -89,7 +89,7 @@ func EnrollWithBackoff(
 		return nil
 	}
 
-	log.Infof("1st enrollment attempt failed, retrying enrolling to URL: %s with exponential backoff (init %s, max %s)", client.URI(), EnrollBackoffInit, EnrollBackoffMax)
+	log.Infof("1st enrollment attempt failed, retrying enrolling to URL: %s with exponential backoff (init %s, max %s)", client.URI(), pkgfleetapi.EnrollBackoffInit, pkgfleetapi.EnrollBackoffMax)
 
 	signal := make(chan struct{})
 	defer close(signal)
@@ -97,12 +97,12 @@ func EnrollWithBackoff(
 	enrollFn := func() error {
 		return enroll(ctx, log, persistentConfig, client, options, configStore)
 	}
-	err = retryEnroll(ctx, err, maxAttempts, log, enrollFn, client.URI(), backExp)
+	err = retryEnroll(ctx, err, maxAttempts, log, enrollFn, client.URI(), backExp, options.RetryOnInvalidToken)
 
 	return err
 }
 
-func retryEnroll(ctx context.Context, err error, maxAttempts int, log *logger.Logger, enrollFn func() error, clientURI string, backExp backoff.Backoff) error {
+func retryEnroll(ctx context.Context, err error, maxAttempts int, log *logger.Logger, enrollFn func() error, clientURI string, backExp backoff.Backoff, retryOnInvalidToken bool) error {
 	attemptNo := 1
 
 RETRYLOOP:
@@ -115,7 +115,7 @@ RETRYLOOP:
 			log.Warn("Remote server is not ready to accept connections(Connection Refused), will retry in a moment.")
 		case errors.Is(err, fleetapi.ErrTemporaryServerError):
 			log.Warnf("Remote server failed to handle the request(%s), will retry in a moment.", err.Error())
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, fleetapi.ErrInvalidToken), err == nil, (maxAttempts != EnrollInfiniteAttempts && attemptNo > maxAttempts):
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, fleetapi.ErrInvalidToken) && !retryOnInvalidToken, err == nil, (maxAttempts != EnrollInfiniteAttempts && attemptNo > maxAttempts):
 			break RETRYLOOP
 		case err != nil:
 			log.Warnf("Error detected: %s, will retry in a moment.", err.Error())
@@ -168,7 +168,7 @@ func enroll(
 		Metadata: fleetapi.Metadata{
 			Local:        metadata,
 			UserProvided: options.UserProvidedMetadata,
-			Tags:         cleanTags(options.Tags),
+			Tags:         info.NormalizeTags(options.Tags),
 		},
 	}
 
@@ -186,7 +186,7 @@ func enroll(
 			errors.TypeNetwork)
 	}
 
-	fleetConfig, err := createFleetConfigFromEnroll(resp.Item.AccessAPIKey, options.EnrollAPIKey, options.ReplaceToken, remoteConfig)
+	fleetConfig, err := createFleetConfigFromEnroll(resp.Item.AccessAPIKey, options.EnrollAPIKey, options.ReplaceToken, remoteConfig, options.CheckinOnStateChange)
 	if err != nil {
 		return err
 	}
@@ -248,15 +248,29 @@ func enroll(
 		return fmt.Errorf("failed to store agent config: %w", err)
 	}
 
-	// clear action store
-	// fail only if file exists and there was a failure
-	if err := os.Remove(paths.AgentActionStoreFile()); !os.IsNotExist(err) {
+	if err := clearAgentStores(paths.AgentActionStoreFile(), paths.AgentStateStoreFile()); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// clearAgentStores removes the action and state store files left over from
+// previous enrollments. A missing file is the happy case.
+func clearAgentStores(actionStoreFile, stateStoreFile string) error {
 	// clear action store
-	// fail only if file exists and there was a failure
-	if err := os.Remove(paths.AgentStateStoreFile()); !os.IsNotExist(err) {
+	// fail only if file exists and there was a failure.
+	// The leading err != nil guard is load-bearing — errors.Is(nil, fs.ErrNotExist)
+	// returns false, so dropping the guard would cause the success case
+	// (err == nil) to fall into the return branch and skip the state
+	// store removal below.
+	if err := os.Remove(actionStoreFile); err != nil && !goerrors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	// clear state store
+	// fail only if file exists and there was a failure.
+	if err := os.Remove(stateStoreFile); err != nil && !goerrors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
@@ -389,6 +403,7 @@ func CreateAgentConfig(agentID string, pc map[string]interface{}, headers map[st
 	if staging != "" {
 		staging := fmt.Sprintf("https://staging.elastic.co/%s-%s/downloads/", release.Version(), staging[:8])
 		agentConfig["download"] = map[string]interface{}{
+			"sources":   []string{staging},
 			"sourceURI": staging,
 		}
 	}
@@ -420,7 +435,7 @@ func SafelyStoreAgentInfo(s saver, reader io.Reader) error {
 func LoadPersistentConfig(pathConfigFile string) (map[string]interface{}, error) {
 	persistentMap := make(map[string]interface{})
 	rawConfig, err := config.LoadFile(pathConfigFile)
-	if os.IsNotExist(err) {
+	if goerrors.Is(err, fs.ErrNotExist) {
 		return persistentMap, nil
 	}
 	if err != nil {
@@ -490,12 +505,15 @@ func storeAgentInfo(s saver, reader io.Reader) error {
 	return nil
 }
 
-func createFleetConfigFromEnroll(accessAPIKey string, enrollmentToken string, replaceToken string, cli remote.Config) (*configuration.FleetAgentConfig, error) {
+func createFleetConfigFromEnroll(accessAPIKey string, enrollmentToken string, replaceToken string, cli remote.Config, checkinOnStateChange bool) (*configuration.FleetAgentConfig, error) {
 	var err error
 	cfg := configuration.DefaultFleetAgentConfig()
 	cfg.Enabled = true
 	cfg.AccessAPIKey = accessAPIKey
 	cfg.Client = cli
+	if checkinOnStateChange {
+		cfg.Checkin.Mode = configuration.FleetCheckinModeOnStateChange
+	}
 	cfg.EnrollmentTokenHash, err = fleetHashToken(enrollmentToken)
 	if err != nil {
 		return nil, errors.New(err, "failed to generate enrollment hash", errors.TypeConfig)
@@ -524,20 +542,4 @@ func fleetHashToken(token string) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(enrollmentHashBytes), nil
-}
-
-func cleanTags(tags []string) []string {
-	var r []string
-	// Create a map to store unique elements
-	seen := make(map[string]bool)
-	for _, str := range tags {
-		tag := strings.TrimSpace(str)
-		if tag != "" {
-			if _, ok := seen[tag]; !ok {
-				seen[tag] = true
-				r = append(r, tag)
-			}
-		}
-	}
-	return r
 }

@@ -9,26 +9,29 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	api "github.com/elastic/fleet-server/pkg/api"
+
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/secret"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/storage"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/vault"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/core/logger/loggertest"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 )
 
 type wrongAction struct{}
 
-func (wrongAction) ID() string                  { return "" }
-func (wrongAction) Type() string                { return "" }
-func (wrongAction) String() string              { return "" }
-func (wrongAction) AckEvent() fleetapi.AckEvent { return fleetapi.AckEvent{} }
+func (wrongAction) ID() string     { return "" }
+func (wrongAction) Type() string   { return "" }
+func (wrongAction) String() string { return "" }
+func (wrongAction) AckEvent(string, time.Time) api.AckRequest_Events_Item {
+	return api.AckRequest_Events_Item{}
+}
 
 func TestStateStore(t *testing.T) {
 	t.Run("ack token", func(t *testing.T) {
@@ -336,8 +339,8 @@ func runTestStateStore(t *testing.T, ackToken string) {
 			ActionType:      fleetapi.ActionTypeUpgrade,
 			ActionStartTime: ts.Format(time.RFC3339),
 			Data: fleetapi.ActionUpgradeData{
-				Version:   "1.2.3",
-				SourceURI: "https://example.com",
+				Version: "1.2.3",
+				Sources: []string{"https://example.com"},
 			}}}
 
 		storePath := filepath.Join(t.TempDir(), "state.json")
@@ -376,9 +379,9 @@ func runTestStateStore(t *testing.T, ackToken string) {
 			ActionType:      fleetapi.ActionTypeUpgrade,
 			ActionStartTime: ts.Format(time.RFC3339),
 			Data: fleetapi.ActionUpgradeData{
-				Version:   "1.2.3",
-				SourceURI: "https://example.com",
-				Retry:     1,
+				Version: "1.2.3",
+				Sources: []string{"https://example.com"},
+				Retry:   1,
 			}},
 			// only the latest upgrade action is kept, however it's not the store
 			// which handled that. Besides upgrade actions are the only
@@ -388,9 +391,9 @@ func runTestStateStore(t *testing.T, ackToken string) {
 				ActionType:      fleetapi.ActionTypeUpgrade,
 				ActionStartTime: ts.Format(time.RFC3339),
 				Data: fleetapi.ActionUpgradeData{
-					Version:   "1.2.4",
-					SourceURI: "https://example.com",
-					Retry:     1,
+					Version: "1.2.4",
+					Sources: []string{"https://example.com"},
+					Retry:   1,
 				}}}
 
 		storePath := filepath.Join(t.TempDir(), "state.json")
@@ -424,7 +427,7 @@ func runTestStateStore(t *testing.T, ackToken string) {
 		}
 	})
 
-	t.Run("when we ACK we save to disk", func(t *testing.T) {
+	t.Run("SetAction + Save persist the action", func(t *testing.T) {
 		ActionPolicyChange := &fleetapi.ActionPolicyChange{
 			ActionID: "abc123",
 		}
@@ -437,10 +440,10 @@ func runTestStateStore(t *testing.T, ackToken string) {
 		require.NoError(t, err)
 		store.SetAckToken(ackToken)
 
-		acker := NewStateStoreActionAcker(&testAcker{}, store)
 		require.Empty(t, store.Action())
 
-		require.NoError(t, acker.Ack(context.Background(), ActionPolicyChange))
+		store.SetAction(ActionPolicyChange)
+		require.NoError(t, store.Save())
 		require.NotNil(t, store.Action(), "store should have an action stored")
 		require.Empty(t, store.Queue())
 		require.Equal(t, ackToken, store.AckToken())
@@ -617,6 +620,29 @@ func runTestStateStore(t *testing.T, ackToken string) {
 			}
 		})
 
+		t.Run("reads legacy source_uri from older state store", func(t *testing.T) {
+			storePath := filepath.Join(t.TempDir(), "state.json")
+			require.NoError(t,
+				os.WriteFile(storePath,
+					[]byte(`{"version":"1","action_queue":[{"id":"testid","type":"UPGRADE","data":{"version":"1.2.3","source_uri":"https://artifacts.elastic.co/downloads"}}]}`),
+					0600),
+				"could not write legacy state store")
+
+			s, err := storage.NewDiskStore(storePath)
+			require.NoError(t, err, "failed creating DiskStore")
+
+			store, err := NewStateStore(log, s)
+			require.NoError(t, err)
+
+			queue := store.Queue()
+			require.Len(t, queue, 1, "action queue should have 1 action")
+			upgradeAction, ok := queue[0].(*fleetapi.ActionUpgrade)
+			require.True(t, ok)
+
+			assert.Equal(t, []string{"https://artifacts.elastic.co/downloads"}, upgradeAction.Data.Sources,
+				"legacy source_uri should be migrated to Sources")
+		})
+
 		t.Run("action queue", func(t *testing.T) {
 			storePath := filepath.Join(t.TempDir(), "state.json")
 			now := time.Now().UTC().Round(time.Second)
@@ -626,9 +652,9 @@ func runTestStateStore(t *testing.T, ackToken string) {
 				ActionStartTime:  now.Format(time.RFC3339),
 				ActionExpiration: now.Add(time.Hour).Format(time.RFC3339),
 				Data: fleetapi.ActionUpgradeData{
-					Version:   "1.2.3",
-					SourceURI: "https://example.com",
-					Retry:     1,
+					Version: "1.2.3",
+					Sources: []string{"https://example.com"},
+					Retry:   1,
 				},
 				Signed: &fleetapi.Signed{
 					Data:      "some data",
@@ -674,38 +700,65 @@ func runTestStateStore(t *testing.T, ackToken string) {
 	})
 }
 
-type testAcker struct {
-	acked     []string
-	ackedLock sync.Mutex
-}
+func TestStateStorePendingAckAction(t *testing.T) {
+	log, _ := loggertest.New("state_store_pending_ack")
 
-func (t *testAcker) Ack(_ context.Context, action fleetapi.Action) error {
-	t.ackedLock.Lock()
-	defer t.ackedLock.Unlock()
-
-	if t.acked == nil {
-		t.acked = make([]string, 0)
+	newStore := func(t *testing.T, path string) *StateStore {
+		s, err := storage.NewDiskStore(path)
+		require.NoError(t, err, "failed creating DiskStore")
+		store, err := NewStateStore(log, s)
+		require.NoError(t, err)
+		return store
 	}
 
-	t.acked = append(t.acked, action.ID())
-	return nil
-}
+	t.Run("round-trips a restart action separately from the main action", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		store := newStore(t, path)
 
-func (t *testAcker) Commit(_ context.Context) error {
-	return nil
-}
+		policyChange := &fleetapi.ActionPolicyChange{ActionID: "policy-1", ActionType: fleetapi.ActionTypePolicyChange}
+		restart := &fleetapi.ActionRestart{ActionID: "restart-1", ActionType: fleetapi.ActionTypeRestart}
 
-func (t *testAcker) Clear() {
-	t.ackedLock.Lock()
-	defer t.ackedLock.Unlock()
+		store.SetAction(policyChange)
+		store.SetPendingAckAction(restart)
+		require.NoError(t, store.Save())
 
-	t.acked = make([]string, 0)
-}
+		reloaded := newStore(t, path)
+		assert.Equal(t, policyChange, reloaded.Action(), "main action should be preserved")
+		assert.Equal(t, restart, reloaded.PendingAckAction(), "pending-ack action should be preserved")
+	})
 
-func (t *testAcker) Items() []string {
-	t.ackedLock.Lock()
-	defer t.ackedLock.Unlock()
-	return t.acked
+	t.Run("ignores unsupported pending-ack action types", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		store := newStore(t, path)
+
+		store.SetPendingAckAction(&fleetapi.ActionUnenroll{ActionID: "u1", ActionType: fleetapi.ActionTypeUnenroll})
+		assert.Nil(t, store.PendingAckAction(), "unsupported pending-ack types must be discarded")
+	})
+
+	t.Run("clears the pending-ack action", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		store := newStore(t, path)
+
+		store.SetPendingAckAction(&fleetapi.ActionRestart{ActionID: "restart-2", ActionType: fleetapi.ActionTypeRestart})
+		require.NoError(t, store.Save())
+		require.NotNil(t, store.PendingAckAction())
+
+		store.ClearPendingAckAction()
+		require.NoError(t, store.Save())
+
+		reloaded := newStore(t, path)
+		assert.Nil(t, reloaded.PendingAckAction(), "cleared pending-ack action must not be reloaded")
+	})
+
+	t.Run("loads a store written without the pending-ack field", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		// A version "1" store without the pending_ack field must remain loadable.
+		require.NoError(t, os.WriteFile(path, []byte(`{"version":"1","ack_token":"tok"}`), 0o600))
+
+		store := newStore(t, path)
+		assert.Nil(t, store.PendingAckAction())
+		assert.Equal(t, "tok", store.AckToken())
+	})
 }
 
 // hasEmptyFields will check if action has any empty fields. It returns a string

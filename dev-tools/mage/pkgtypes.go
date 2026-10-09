@@ -80,6 +80,9 @@ var (
 	Docker             = PackageType(pkgcommon.Docker)
 )
 
+// AllPackageTypes contains all available package types.
+var AllPackageTypes = []PackageType{RPM, Deb, Zip, TarGz, Docker}
+
 // OSPackageArgs define a set of package types to build for an operating
 // system using the contained PackageSpec.
 type OSPackageArgs struct {
@@ -606,13 +609,12 @@ func PackageZip(spec PackageSpec) error {
 	w := zip.NewWriter(buf)
 	baseDir := spec.rootDir()
 
-	// Add files to zip.
-	for _, pkgFile := range spec.Files {
+	// Add files to zip (dirs before files so explicit entries take precedence).
+	for _, pkgFile := range dirsFirst(spec.Files) {
 		if pkgFile.Symlink {
 			// not supported on zip archives
 			continue
 		}
-
 		if err := addFileToZip(w, baseDir, pkgFile); err != nil {
 			p, _ := filepath.Abs(pkgFile.Source)
 			return fmt.Errorf("failed adding file=%+v to zip: %w", p, err)
@@ -701,13 +703,18 @@ func PackageTarGz(spec PackageSpec) error {
 	// 	spec.Files = newFiles
 	// }
 
-	// Add files to tar.
-	for _, pkgFile := range spec.Files {
+	// When building multiple package types simultaneously (e.g. PACKAGES=all),
+	// components that only support Docker may land in the shared drop path.
+	// Derive the exclusion list from the spec's component definitions so any
+	// future Docker-only component is also excluded without a code change.
+	excludedFromTar := componentFilesNotSupportingPackageType(spec.Components, pkgcommon.TarGz)
+
+	// Add files to tar (dirs before files so explicit entries take precedence).
+	for _, pkgFile := range dirsFirst(spec.Files) {
 		if pkgFile.Symlink {
 			continue
 		}
-
-		if err := addFileToTar(w, baseDir, pkgFile); err != nil {
+		if err := addFileToTar(w, baseDir, pkgFile, excludedFromTar); err != nil {
 			return fmt.Errorf("failed adding file=%+v to tar: %w", pkgFile, err)
 		}
 	}
@@ -886,10 +893,35 @@ func addUIDGidEnvArgs(args []string) ([]string, error) {
 			"Using UID=%d GID=%d", uid, gid)
 	}
 
-	return append(args,
-		"-e", "EXEC_UID="+strconv.Itoa(uid),
-		"-e", "EXEC_GID="+strconv.Itoa(gid),
-	), nil
+	// In rootless Docker, container UID 0 maps to the host user's UID, so files
+	// created as root inside the container are already owned by the correct user
+	// on the host.
+	if !isRootlessDocker() {
+		args = append(args,
+			"-e", "EXEC_UID="+strconv.Itoa(uid),
+			"-e", "EXEC_GID="+strconv.Itoa(gid),
+		)
+	}
+
+	return args, nil
+}
+
+// dirsFirst returns files with directory-source entries (paths ending in "/")
+// before regular-file entries, so explicit files always overwrite any
+// conflicting path laid down by a directory expansion.
+func dirsFirst(files map[string]PackageFile) []PackageFile {
+	out := make([]PackageFile, 0, len(files))
+	for _, f := range files {
+		if strings.HasSuffix(f.Source, "/") {
+			out = append(out, f)
+		}
+	}
+	for _, f := range files {
+		if !strings.HasSuffix(f.Source, "/") {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // addFileToZip adds a file (or directory) to a zip archive.
@@ -951,7 +983,7 @@ func addFileToZip(ar *zip.Writer, baseDir string, pkgFile PackageFile) error {
 			return nil
 		}
 
-		file, err := os.Open(path)
+		file, err := os.Open(path) //nolint:gosec // G122: path comes from filepath.Walk on trusted build inputs, no user-controlled symlink attack surface
 		if err != nil {
 			return err
 		}
@@ -964,10 +996,22 @@ func addFileToZip(ar *zip.Writer, baseDir string, pkgFile PackageFile) error {
 	})
 }
 
-// addFileToTar adds a file (or directory) to a tar archive.
-func addFileToTar(ar *tar.Writer, baseDir string, pkgFile PackageFile) error {
-	excludedFiles := []string{}
+// componentFilesNotSupportingPackageType returns the binary names and spec
+// filenames of components whose packageTypes field does not include pkgType.
+// These files should be excluded when assembling an archive of that type.
+func componentFilesNotSupportingPackageType(components []packaging.BinarySpec, pkgType pkgcommon.PackageType) []string {
+	var excluded []string
+	for _, comp := range components {
+		if !comp.SupportsPackageType(pkgType) {
+			excluded = append(excluded, comp.BinaryName, comp.BinaryName+".spec.yml")
+		}
+	}
+	return excluded
+}
 
+// addFileToTar adds a file (or directory) to a tar archive.
+// excludedFiles is a list of base filenames (not paths) to skip during the walk.
+func addFileToTar(ar *tar.Writer, baseDir string, pkgFile PackageFile, excludedFiles []string) error {
 	return filepath.WalkDir(pkgFile.Source, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if pkgFile.SkipOnMissing && os.IsNotExist(err) {
@@ -1034,7 +1078,7 @@ func addFileToTar(ar *tar.Writer, baseDir string, pkgFile PackageFile) error {
 			return nil
 		}
 
-		file, err := os.Open(path)
+		file, err := os.Open(path) //nolint:gosec // G122: path comes from filepath.WalkDir on trusted build inputs, no user-controlled symlink attack surface
 		if err != nil {
 			return err
 		}

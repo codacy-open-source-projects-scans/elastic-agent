@@ -18,19 +18,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 	integrationtest "github.com/elastic/elastic-agent/pkg/testing"
 	"github.com/elastic/elastic-agent/pkg/testing/define"
 	"github.com/elastic/elastic-agent/pkg/testing/tools/check"
 	"github.com/elastic/elastic-agent/pkg/testing/tools/testcontext"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/testing/fleetservertest"
 	"github.com/elastic/elastic-agent/testing/integration"
 )
 
 func TestFleetScheduledUpgrade(t *testing.T) {
 	_ = define.Require(t, define.Requirements{
-		Group: integration.Fleet,
+		Group: integration.FleetUpgrade,
 		Stack: &define.Stack{},
 		Local: false, // requires Agent installation
 		Sudo:  true,  // requires Agent installation
@@ -176,6 +176,7 @@ func TestFleetScheduledUpgrade(t *testing.T) {
 			ActionID: cancelActionUUID,
 			Data:     fmt.Sprintf(`{"target_id": "%s"}`, scheduledActionUUID),
 		})
+		require.NoError(t, err, "failed to create cancel action")
 		checkinWithAcker.AddCheckin("token", 1*time.Second, cancelAction)
 
 		// Wait and check that elastic-agent has reported a more recent checkin
@@ -242,6 +243,7 @@ func TestFleetScheduledUpgrade(t *testing.T) {
 			ActionID: cancelExpiredActionUUID,
 			Data:     fmt.Sprintf(`{"target_id": "%s"}`, scheduledExpiredActionUUID),
 		})
+		require.NoError(t, err, "failed to create cancel expired action")
 		checkinWithAcker.AddCheckin("token", 1*time.Second, cancelExpiredAction)
 
 		// Wait and check that elastic-agent has reported a more recent checkin
@@ -333,6 +335,7 @@ func TestFleetScheduledUpgrade(t *testing.T) {
 			ActionID: cancelActionUUID,
 			Data:     fmt.Sprintf(`{"target_id": "%s"}`, scheduledActionUUID),
 		})
+		require.NoError(t, err, "failed to create cancel action")
 		checkinWithAcker.AddCheckin("token", 1*time.Second, cancelAction)
 
 		// Wait and check that elastic-agent has reported a more recent checkin

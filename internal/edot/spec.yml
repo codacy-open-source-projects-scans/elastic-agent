@@ -315,6 +315,11 @@ inputs:
     platforms: *platforms
     outputs: *outputs
     command: *heartbeat_command
+  - name: synthetics/api
+    description: "Synthetics API Monitor"
+    platforms: *platforms
+    outputs: *outputs
+    command: *heartbeat_command
   - name: beat/metrics
     description: "Beat metrics"
     platforms: *platforms
@@ -581,6 +586,8 @@ inputs:
     description: "Osquery"
     platforms: *platforms
     outputs: *outputs
+    # Ensure there is only a single osqueryd daemon to manage by using a single receiver.
+    single_receiver: true
     command:
       restart_monitoring_period: 5s
       maximum_restarts_per_period: 1

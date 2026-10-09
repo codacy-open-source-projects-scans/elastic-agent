@@ -29,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.elastic.co/apm/v2/apmtest"
 	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/featuregate"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/elastic/elastic-agent-libs/logp"
@@ -39,12 +40,11 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/reexec"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/transpiler"
 	"github.com/elastic/elastic-agent/internal/pkg/capabilities"
 	"github.com/elastic/elastic-agent/internal/pkg/config"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
+	monitoringCfg "github.com/elastic/elastic-agent/internal/pkg/core/monitoring/config"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker"
 	"github.com/elastic/elastic-agent/internal/pkg/release"
 	"github.com/elastic/elastic-agent/pkg/component"
@@ -53,6 +53,8 @@ import (
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/core/logger/loggertest"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	"github.com/elastic/elastic-agent/pkg/utils/broadcaster"
 )
 
@@ -573,7 +575,7 @@ func TestUpgradeSameErrorAcked(t *testing.T) {
 	acker.On("Ack", mock.Anything, actionUpgrade).Return(nil)
 	acker.On("Commit", mock.Anything).Return(nil)
 
-	require.NoError(t, coord.Upgrade(t.Context(), "9.0", "http://localhost", actionUpgrade, WithSkipVerifyOverride(true), WithSkipDefaultPgp(true)))
+	require.NoError(t, coord.Upgrade(t.Context(), "9.0", []string{"http://localhost"}, actionUpgrade, WithSkipVerifyOverride(true), WithSkipDefaultPgp(true)))
 
 	acker.AssertCalled(t, "Ack", mock.Anything, actionUpgrade)
 	acker.AssertCalled(t, "Commit", mock.Anything)
@@ -618,7 +620,7 @@ func TestReplayedRollbackActionAcked(t *testing.T) {
 		acker.On("Commit", mock.Anything).Return(nil)
 
 		// A rollback targeting the current version should be detected as replayed and acked without processing
-		require.NoError(t, coord.Upgrade(t.Context(), release.VersionWithSnapshot(), "", actionUpgrade, WithRollback(true)))
+		require.NoError(t, coord.Upgrade(t.Context(), release.VersionWithSnapshot(), nil, actionUpgrade, WithRollback(true)))
 
 		acker.AssertCalled(t, "Ack", mock.Anything, actionUpgrade)
 		acker.AssertCalled(t, "Commit", mock.Anything)
@@ -639,13 +641,17 @@ func TestReplayedRollbackActionAcked(t *testing.T) {
 }
 
 func TestPreUpgradeCallback(t *testing.T) {
+	// Verify that WithPreUpgradeCallback is forwarded to upgradeMgr.Upgrade as an
+	// upgrade.WithPreSymlinkCallback option. The callback is invoked by the
+	// upgrader (not by the coordinator directly); if it returns an error the
+	// whole upgrade fails and the error is propagated back to the caller.
 	coordCh := make(chan error)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	upgradeManager := &fakeUpgradeManager{
 		upgradeable: true,
-		upgradeErr:  upgrade.ErrUpgradeSameVersion,
+		// No upgradeErr — the error comes from the pre-symlink callback itself.
 	}
 
 	acker := acker.NewMockAcker(t)
@@ -669,15 +675,14 @@ func TestPreUpgradeCallback(t *testing.T) {
 
 	preUpgradeCallbackErr := errors.New("pre upgrade callback error")
 
-	upgradeErr := coord.Upgrade(t.Context(), "9.0", "http://localhost", actionUpgrade,
+	upgradeErr := coord.Upgrade(t.Context(), "9.0", []string{"http://localhost"}, actionUpgrade,
 		WithSkipVerifyOverride(true), WithSkipDefaultPgp(true),
 		WithPreUpgradeCallback(func(ctx context.Context, log *logger.Logger, action *fleetapi.ActionUpgrade) error {
 			return preUpgradeCallbackErr
 		}))
 
-	assert.ErrorIs(t, preUpgradeCallbackErr, upgradeErr)
+	assert.ErrorIs(t, upgradeErr, preUpgradeCallbackErr)
 	assert.Nil(t, coord.overrideState)
-	assert.Equal(t, preUpgradeCallbackErr, upgradeErr, "expected pre upgrade callback error")
 	assert.Eventually(t, func() bool {
 		ud := coord.State().UpgradeDetails
 		return ud != nil && ud.State == details.StateFailed
@@ -1061,7 +1066,7 @@ func TestCoordinator_Upgrade(t *testing.T) {
 	require.NoError(t, err)
 	cfgMgr.Config(ctx, cfg)
 
-	err = coord.Upgrade(ctx, "9.0.0", "", nil, WithSkipVerifyOverride(true), WithSkipDefaultPgp(false))
+	err = coord.Upgrade(ctx, "9.0.0", nil, nil, WithSkipVerifyOverride(true), WithSkipDefaultPgp(false))
 	require.ErrorIs(t, err, ErrNotUpgradable)
 	cancel()
 
@@ -1098,7 +1103,7 @@ func TestCoordinator_UpgradeDetails(t *testing.T) {
 	require.NoError(t, err)
 	cfgMgr.Config(ctx, cfg)
 
-	err = coord.Upgrade(ctx, "9.0.0", "", nil, WithSkipVerifyOverride(true), WithSkipDefaultPgp(false))
+	err = coord.Upgrade(ctx, "9.0.0", nil, nil, WithSkipVerifyOverride(true), WithSkipDefaultPgp(false))
 	require.ErrorIs(t, expectedErr, err)
 	cancel()
 
@@ -1162,6 +1167,160 @@ func Test_ApplyPersistedConfig(t *testing.T) {
 			assert.Equal(t, tc.expectedOutputType, outputType, "output type should be %s, got %s", tc.expectedOutputType, outputType)
 		})
 	}
+}
+
+func TestExtensionsAreMergedInOrder(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		fleetFile               string
+		persistedFile           string
+		expectedExtensionsOrder []string
+	}{
+		{
+			name:          "extensions are merged in the order of the source file",
+			fleetFile:     filepath.Join(".", "testdata", "config_fleet.yaml"),
+			persistedFile: filepath.Join(".", "testdata", "service_populated.yaml"),
+			expectedExtensionsOrder: []string{
+				"headers_setter/fleet",
+				"headers_setter/api_key",
+				"headers_setter/persisted",
+			},
+		},
+		{
+			name:          "extensions are merged in the order of the source file",
+			fleetFile:     filepath.Join(".", "testdata", "config_fleet.yaml"),
+			persistedFile: filepath.Join(".", "testdata", "service_populated_with_dup.yaml"),
+			expectedExtensionsOrder: []string{
+				"headers_setter/fleet",
+				"headers_setter/api_key",
+				"headers_setter/persisted",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fleetCfg, err := config.LoadFile(tc.fleetFile)
+			require.NoError(t, err)
+
+			testLogger, _ := loggertest.New("")
+
+			registry := featuregate.GlobalRegistry()
+			require.NoError(t, registry.Set("confmap.enableMergeAppendOption", true))
+			t.Cleanup(func() {
+				_ = registry.Set("confmap.enableMergeAppendOption", false)
+			})
+
+			err = applyPersistedConfig(testLogger, fleetCfg, tc.persistedFile)
+			require.NoError(t, err)
+
+			// verify extensions contain both values
+			extensions, ok := fleetCfg.OTel.Get("extensions").(map[string]interface{})
+			require.True(t, ok)
+			require.Equal(t, len(tc.expectedExtensionsOrder), len(extensions))
+			for _, ext := range tc.expectedExtensionsOrder {
+				_, ok = extensions[ext]
+				require.True(t, ok)
+			}
+
+			// verify service contains both values in service.extensions array
+
+			serviceExtensions, ok := fleetCfg.OTel.Get("service::extensions").([]any)
+			require.True(t, ok)
+			require.Equal(t, len(tc.expectedExtensionsOrder), len(serviceExtensions))
+			for i := range len(tc.expectedExtensionsOrder) {
+				require.Equal(t, tc.expectedExtensionsOrder[i], serviceExtensions[i].(string))
+			}
+		})
+	}
+}
+
+func TestOtelConfigIsMerged(t *testing.T) {
+	// this test loads config from service_populated.yaml and verifies that the extensions are merged
+	// with already prepopulated extensions in agent configuration
+	// we are testing extensions, processors, pipelines, exporters
+	// those coming from file are named type/persisted those from config type/fleet
+	// test passes when all extensions, processors, pipelines, exporters are present in the merged config
+	// single test for all of those
+	// we're testing these keys:
+	// - extensions
+	// - service.extensions
+	// - service.pipelines
+	// - processors
+	// - pipelines
+	// - exporters
+	// - receivers
+
+	fleetCfg, err := config.LoadFile(filepath.Join(".", "testdata", "config_fleet.yaml"))
+	require.NoError(t, err)
+
+	testLogger, _ := loggertest.New("")
+
+	registry := featuregate.GlobalRegistry()
+	require.NoError(t, registry.Set("confmap.enableMergeAppendOption", true))
+	t.Cleanup(func() {
+		_ = registry.Set("confmap.enableMergeAppendOption", false)
+	})
+
+	err = applyPersistedConfig(testLogger, fleetCfg, filepath.Join(".", "testdata", "service_populated.yaml"))
+	require.NoError(t, err)
+
+	// verify extensions contain both values
+	extensions, ok := fleetCfg.OTel.Get("extensions").(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 3, len(extensions))
+	_, ok = extensions["headers_setter/persisted"]
+	require.True(t, ok)
+	_, ok = extensions["headers_setter/api_key"]
+	require.True(t, ok)
+	_, ok = extensions["headers_setter/fleet"]
+	require.True(t, ok)
+
+	// verify service contains both values in service.extensions array
+
+	serviceExtensions, ok := fleetCfg.OTel.Get("service::extensions").([]any)
+	require.True(t, ok)
+	require.Equal(t, 3, len(serviceExtensions))
+	require.Equal(t, "headers_setter/fleet", serviceExtensions[0].(string))
+	require.Equal(t, "headers_setter/api_key", serviceExtensions[1].(string))
+	require.Equal(t, "headers_setter/persisted", serviceExtensions[2].(string))
+
+	// verify processors contain both values
+	processors, ok := fleetCfg.OTel.Get("processors").(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 2, len(processors))
+	_, ok = processors["batch/persisted"]
+	require.True(t, ok)
+	_, ok = processors["batch/fleet"]
+	require.True(t, ok)
+
+	// verify service contains both values in service.pipelines map
+	pipelines, ok := fleetCfg.OTel.Get("service::pipelines").(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 2, len(pipelines))
+	_, ok = pipelines["logs/persisted"]
+	require.True(t, ok)
+	_, ok = pipelines["logs/fleet"]
+	require.True(t, ok)
+
+	// verify exporters contain both values
+	exporters, ok := fleetCfg.OTel.Get("exporters").(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 2, len(exporters))
+	_, ok = exporters["nop/persisted"]
+	require.True(t, ok)
+	_, ok = exporters["nop/fleet"]
+	require.True(t, ok)
+
+	// verify receivers contain both values
+	receivers, ok := fleetCfg.OTel.Get("receivers").(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 2, len(receivers))
+	_, ok = receivers["nop/persisted"]
+	require.True(t, ok)
+	_, ok = receivers["nop/fleet"]
+	require.True(t, ok)
+
 }
 
 // Test_Coordinator_OTelManagerReceivesPersistedConfig verifies that the OTel manager
@@ -1372,14 +1531,54 @@ exporters:
 	}
 }
 
+func TestProcessConfig_TagsAreApplied(t *testing.T) {
+	tests := []struct {
+		name       string
+		standalone bool
+	}{
+		{name: "standalone mode", standalone: true},
+		{name: "managed mode", standalone: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockAgent := info.NewMockAgent(t)
+			mockAgent.EXPECT().IsStandalone().Return(tt.standalone).Once()
+			mockAgent.EXPECT().SetTags([]string{"tag1", "tag2"}).Return().Once()
+			mockAgent.EXPECT().GetTags().Return([]string{"tag1", "tag2"}).Once()
+
+			coord := &Coordinator{
+				logger:           logp.NewLogger("testing"),
+				agentInfo:        mockAgent,
+				secretMarkerFunc: testSecretMarkerFunc,
+			}
+
+			cfg := config.MustNewConfigFrom(map[string]interface{}{
+				// tag1 should be deduplicated since it appears twice and has leading/trailing spaces.
+				"agent.tags": []string{"tag1", "tag2", " tag1 "},
+			})
+			err := coord.processConfig(t.Context(), cfg)
+			require.NoError(t, err)
+
+			assert.Equal(t, []string{"tag1", "tag2"}, coord.state.Tags)
+			assert.Equal(t, []string{"tag1", "tag2"}, coord.agentInfo.GetTags())
+		})
+	}
+}
+
 // fakeCapabilities implements the capabilities.Capabilities interface for testing
 type fakeCapabilities struct {
 	mock.Mock
 }
 
-func (f *fakeCapabilities) AllowUpgrade(version string, sourceURI string) bool {
-	args := f.Called(version, sourceURI)
+func (f *fakeCapabilities) AllowUpgrade(version string, sources []string) bool {
+	args := f.Called(version, sources)
 	return args.Bool(0)
+}
+
+func (f *fakeCapabilities) FilterUpgradeSources(version string, sources []string) []string {
+	args := f.Called(version, sources)
+	return args.Get(0).([]string)
 }
 
 func (f *fakeCapabilities) AllowInput(name string) bool {
@@ -1603,8 +1802,11 @@ func (f *fakeUpgradeManager) Reload(cfg *config.Config) error {
 	return nil
 }
 
-func (f *fakeUpgradeManager) Upgrade(ctx context.Context, version string, rollback bool, sourceURI string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes ...string) (_ reexec.ShutdownCallbackFn, err error) {
+func (f *fakeUpgradeManager) Upgrade(ctx context.Context, version string, rollback bool, sources []string, action *fleetapi.ActionUpgrade, details *details.Details, skipVerifyOverride bool, skipDefaultPgp bool, pgpBytes []string, opts ...upgrade.Option) (_ reexec.ShutdownCallbackFn, err error) {
 	f.upgradeCalled = true
+	if cbErr := upgrade.InvokePreSymlinkCallback(opts, ctx, nil, action); cbErr != nil {
+		return nil, cbErr
+	}
 	if f.upgradeErr != nil {
 		return nil, f.upgradeErr
 	}
@@ -1785,6 +1987,49 @@ func (f *fakeVarsManager) DefaultProvider() string {
 	return ""
 }
 
+// TestCoordinator_PerformAction_RoutesByRuntimeManager verifies that
+// Coordinator.PerformAction routes to the otel manager for components running
+// under the OTel runtime, and to the runtime (process) manager otherwise.
+func TestCoordinator_PerformAction_RoutesByRuntimeManager(t *testing.T) {
+	var runtimeCalled, otelCalled bool
+	runtimeMgr := &fakeRuntimeManager{
+		performActionCallback: func(_ context.Context, _ component.Component, _ component.Unit, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+			runtimeCalled = true
+			return map[string]interface{}{"via": "runtime"}, nil
+		},
+	}
+	otelMgr := &fakeOTelManager{
+		performActionCallback: func(_ context.Context, _ component.Component, _ component.Unit, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+			otelCalled = true
+			return map[string]interface{}{"via": "otel"}, nil
+		},
+	}
+	coord := &Coordinator{
+		runtimeMgr: runtimeMgr,
+		otelMgr:    otelMgr,
+	}
+
+	t.Run("process runtime routes to runtimeMgr", func(t *testing.T) {
+		runtimeCalled, otelCalled = false, false
+		comp := component.Component{ID: "osquery-default", RuntimeManager: component.ProcessRuntimeManager}
+		res, err := coord.PerformAction(context.Background(), comp, component.Unit{}, "osquery", nil)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]interface{}{"via": "runtime"}, res)
+		assert.True(t, runtimeCalled, "runtimeMgr.PerformAction should have been called")
+		assert.False(t, otelCalled, "otelMgr.PerformAction should not have been called")
+	})
+
+	t.Run("otel runtime routes to otelMgr", func(t *testing.T) {
+		runtimeCalled, otelCalled = false, false
+		comp := component.Component{ID: "osquery-default", RuntimeManager: component.OtelRuntimeManager}
+		res, err := coord.PerformAction(context.Background(), comp, component.Unit{}, "osquery", nil)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]interface{}{"via": "otel"}, res)
+		assert.True(t, otelCalled, "otelMgr.PerformAction should have been called")
+		assert.False(t, runtimeCalled, "runtimeMgr.PerformAction should not have been called")
+	})
+}
+
 var _ OTelManager = (*fakeOTelManager)(nil)
 
 type fakeOTelManager struct {
@@ -1792,6 +2037,7 @@ type fakeOTelManager struct {
 	updateComponentCallback             func([]component.Component) error
 	performDiagnosticsCallback          func(context.Context, ...runtime.ComponentUnitDiagnosticRequest) []runtime.ComponentUnitDiagnostic
 	performComponentDiagnosticsCallback func(context.Context, []cproto.AdditionalDiagnosticRequest, ...component.Component) ([]runtime.ComponentDiagnostic, error)
+	performActionCallback               func(context.Context, component.Component, component.Unit, string, map[string]interface{}) (map[string]interface{}, error)
 	errChan                             chan error
 	collectorStatusChan                 chan *status.AggregateStatus
 	componentStateChan                  chan []runtime.ComponentComponentState
@@ -1806,7 +2052,7 @@ func (f *fakeOTelManager) Errors() <-chan error {
 	return f.errChan
 }
 
-func (f *fakeOTelManager) Update(cfg *confmap.Conf, settings *configuration.SettingsConfig, ll logp.Level, components []component.Component) {
+func (f *fakeOTelManager) Update(cfg *confmap.Conf, monitoring *monitoringCfg.MonitoringConfig, ll logp.Level, components []component.Component) {
 	var collectorResult, componentResult error
 	if f.updateCollectorCallback != nil {
 		collectorResult = f.updateCollectorCallback(cfg)
@@ -1848,12 +2094,20 @@ func (f *fakeOTelManager) PerformComponentDiagnostics(ctx context.Context, addit
 	return nil, nil
 }
 
+func (f *fakeOTelManager) PerformAction(ctx context.Context, comp component.Component, unit component.Unit, name string, params map[string]interface{}) (map[string]interface{}, error) {
+	if f.performActionCallback != nil {
+		return f.performActionCallback(ctx, comp, unit, name, params)
+	}
+	return nil, nil
+}
+
 // An implementation of the RuntimeManager interface for use in testing.
 type fakeRuntimeManager struct {
 	state                               []runtime.ComponentComponentState
 	updateCallback                      func([]component.Component) error
 	performDiagnosticsCallback          func(context.Context, ...runtime.ComponentUnitDiagnosticRequest) []runtime.ComponentUnitDiagnostic
 	performComponentDiagnosticsCallback func(context.Context, []cproto.AdditionalDiagnosticRequest, ...component.Component) ([]runtime.ComponentDiagnostic, error)
+	performActionCallback               func(context.Context, component.Component, component.Unit, string, map[string]interface{}) (map[string]interface{}, error)
 	result                              error
 	errChan                             chan error
 }
@@ -1882,7 +2136,10 @@ func (r *fakeRuntimeManager) State() []runtime.ComponentComponentState {
 }
 
 // PerformAction executes an action on a unit.
-func (r *fakeRuntimeManager) PerformAction(_ context.Context, _ component.Component, _ component.Unit, _ string, _ map[string]interface{}) (map[string]interface{}, error) {
+func (r *fakeRuntimeManager) PerformAction(ctx context.Context, comp component.Component, unit component.Unit, name string, params map[string]interface{}) (map[string]interface{}, error) {
+	if r.performActionCallback != nil {
+		return r.performActionCallback(ctx, comp, unit, name, params)
+	}
 	return nil, nil
 }
 

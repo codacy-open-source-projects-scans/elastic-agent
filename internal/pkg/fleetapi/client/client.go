@@ -18,6 +18,7 @@ import (
 	"github.com/elastic/elastic-agent/internal/pkg/release"
 	"github.com/elastic/elastic-agent/internal/pkg/remote"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
+	api "github.com/elastic/fleet-server/pkg/api"
 )
 
 const (
@@ -33,14 +34,13 @@ type Sender interface {
 		path string,
 		params url.Values,
 		headers http.Header,
-		body io.Reader,
+		body io.ReadSeeker,
 	) (*http.Response, error)
 
 	URI() string
 }
 
-// Default value for Elastic-Api-Version header when sending requests to Fleet (that's the only version we have at the time of writing)
-const defaultFleetApiVersion = "2023-06-01"
+const defaultFleetApiVersion = api.DefaultFleetAPIVersion
 
 var baseRoundTrippers = func(rt http.RoundTripper) (http.RoundTripper, error) {
 	rt = NewFleetUserAgentRoundTripper(rt, release.Version())
@@ -129,22 +129,35 @@ func ExtractError(resp io.Reader) error {
 	return fmt.Errorf("could not decode the response, raw response: %s", string(data))
 }
 
-func CheckRemote(ctx context.Context, c Sender) error {
+func CheckRemote(ctx context.Context, log *logger.Logger, c Sender) error {
 	ctx, cancel := context.WithTimeout(ctx, apiStatusTimeout)
 	defer cancel()
 
 	resp, err := c.Send(ctx, http.MethodGet, statusPath, nil, nil, nil)
 	if err != nil {
-		return fmt.Errorf("fail to communicate with Fleet Server API client hosts: %w", err)
+		err = fmt.Errorf("fail to communicate with Fleet Server API client hosts: %w", err)
+		log.Warn(err)
+		return err
 	}
+
+	// discard body for proper cancellation and connection reuse.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fleet server ping returned a bad status code: %d", resp.StatusCode)
+		err := fmt.Errorf("fleet server ping returned a bad status code: %d", resp.StatusCode)
+		log.Warn(err)
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+			// treat 429, 503 as potentially recoverable so they don't cause a failed state
+			// 502 (Bad Gateway) and 504 (Gateway Timeout) are intentionally
+			// not included for this check as they may indicate a
+			// misconfiguration issue despite being considered retryable
+			return errors.NewRecoverable(err)
+		}
+		return err
 	}
-
-	// discard body for proper cancellation and connection reuse
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
 
 	return nil
 }

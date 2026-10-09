@@ -17,13 +17,15 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
+	api "github.com/elastic/fleet-server/pkg/api"
+
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/actions/handlers"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker"
 	"github.com/elastic/elastic-agent/internal/pkg/fleetapi/acker/noop"
 	"github.com/elastic/elastic-agent/internal/pkg/queue"
 	"github.com/elastic/elastic-agent/pkg/core/logger/loggertest"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 )
 
 type mockHandler struct {
@@ -61,9 +63,9 @@ func (m *mockAction) String() string {
 	args := m.Called()
 	return args.String(0)
 }
-func (m *mockAction) AckEvent() fleetapi.AckEvent {
-	args := m.Called()
-	return args.Get(0).(fleetapi.AckEvent)
+func (m *mockAction) AckEvent(agentID string, ts time.Time) api.AckRequest_Events_Item {
+	args := m.Called(agentID, ts)
+	return args.Get(0).(api.AckRequest_Events_Item)
 }
 func (m *mockScheduledAction) StartTime() (time.Time, error) {
 	args := m.Called()
@@ -720,8 +722,8 @@ func TestActionDispatcher(t *testing.T) {
 			ActionType:      fleetapi.ActionTypeUpgrade,
 			ActionStartTime: time.Now().Add(1 * time.Hour).Format(time.RFC3339),
 			Data: fleetapi.ActionUpgradeData{
-				Version:   "9.3.0",
-				SourceURI: "https://test-uri.test.com",
+				Version: "9.3.0",
+				Sources: []string{"https://test-uri.test.com"},
 			},
 		}
 
@@ -769,8 +771,8 @@ func TestActionDispatcher(t *testing.T) {
 			ActionID:   "upgrade-action-id",
 			ActionType: fleetapi.ActionTypeUpgrade,
 			Data: fleetapi.ActionUpgradeData{
-				Version:   "9.3.0",
-				SourceURI: "https://test-uri.test.com",
+				Version: "9.3.0",
+				Sources: []string{"https://test-uri.test.com"},
 			},
 		}
 		def.On("Handle",

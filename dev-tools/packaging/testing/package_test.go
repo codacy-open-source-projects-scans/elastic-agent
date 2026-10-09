@@ -15,7 +15,6 @@ import (
 	"compress/gzip"
 	"crypto/sha512"
 	"debug/buildinfo"
-	"debug/elf"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -53,16 +52,21 @@ const (
 )
 
 var (
-	excludedPathsPattern    = regexp.MustCompile(`node_modules`)
-	configFilePattern       = regexp.MustCompile(`.*beat\.spec.yml$|.*beat\.yml$|apm-server\.yml|elastic-agent\.yml$$`)
-	otelcolScriptPattern    = regexp.MustCompile(`/otelcol$`)
-	manifestFilePattern     = regexp.MustCompile(`manifest.yml`)
-	modulesDirPattern       = regexp.MustCompile(`module/.+`)
-	modulesDDirPattern      = regexp.MustCompile(`modules.d/$`)
-	modulesDFilePattern     = regexp.MustCompile(`modules.d/.+`)
-	monitorsDFilePattern    = regexp.MustCompile(`monitors.d/.+`)
-	systemdUnitFilePattern  = regexp.MustCompile(`/lib/systemd/system/.*\.service`)
-	hintsInputsDFilePattern = regexp.MustCompile(`usr/share/elastic-agent/hints.inputs.d/.*\.yml`)
+	excludedPathsPattern        = regexp.MustCompile(`node_modules`)
+	configFilePattern           = regexp.MustCompile(`.*beat\.spec.yml$|.*beat\.yml$|apm-server\.yml|elastic-agent\.yml$$`)
+	otelcolScriptPattern        = regexp.MustCompile(`/otelcol$`)
+	manifestFilePattern         = regexp.MustCompile(`manifest.yml`)
+	modulesDirPattern           = regexp.MustCompile(`module/.+`)
+	modulesDDirPattern          = regexp.MustCompile(`modules.d/$`)
+	modulesDFilePattern         = regexp.MustCompile(`modules.d/.+`)
+	monitorsDFilePattern        = regexp.MustCompile(`monitors.d/.+`)
+	systemdUnitFilePattern      = regexp.MustCompile(`/lib/systemd/system/.*\.service`)
+	hintsInputsDFilePattern     = regexp.MustCompile(`usr/share/elastic-agent/hints.inputs.d/.*\.yml`)
+	otelSamplesFilePattern      = regexp.MustCompile(`otel_samples/.+[^/]$`)
+	otelCollectorSpecPattern    = regexp.MustCompile(`elastic-otel-collector\.spec\.yml$`)
+	endpointResourcesZipPattern = regexp.MustCompile(`endpoint-security-resources\.zip$`)
+	cloudDefendPattern          = regexp.MustCompile(`/cloud-defend(\.spec\.yml)?$`)
+	componentYmlPattern         = regexp.MustCompile(`usr/share/elastic-agent/data/elastic-agent-[^/]+/components/.+\.yml$`)
 
 	licenseFiles = []string{"LICENSE.txt", "NOTICE.txt"}
 )
@@ -197,6 +201,9 @@ func checkRPM(t *testing.T, file string) {
 	checkMonitorsDPresent(t, "/etc", p)
 	checkLicensesPresent(t, "/usr/share", p)
 	checkSystemdUnitPermissions(t, p)
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 	ensureNoBuildIDLinks(t, p)
 }
 
@@ -219,6 +226,9 @@ func checkDeb(t *testing.T, file string, buf *bytes.Buffer) {
 	checkModulesOwner(t, p, true)
 	checkModulesPermissions(t, p)
 	checkSystemdUnitPermissions(t, p)
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 }
 
 func checkTar(t *testing.T, file string, fipsCheck bool) {
@@ -235,7 +245,11 @@ func checkTar(t *testing.T, file string, fipsCheck bool) {
 	checkModulesDPresent(t, "", p)
 	checkModulesPermissions(t, p)
 	checkModulesOwner(t, p, true)
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 	checkLicensesPresent(t, "", p)
+	checkCloudDefendNotPresent(t, p)
 
 	// extract archive in a temporary directory
 	tempExtractionPath := t.TempDir()
@@ -266,6 +280,9 @@ func checkZip(t *testing.T, file string) {
 	checkModulesPresent(t, "", p)
 	checkModulesDPresent(t, "", p)
 	checkModulesPermissions(t, p)
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 	checkLicensesPresent(t, "", p)
 
 	// extract archive in a temporary directory
@@ -427,6 +444,10 @@ func checkDocker(t *testing.T, file string, fipsPackage bool) (string, int64) {
 		return checkEdotCollectorDocker(t, file)
 	}
 
+	if strings.Contains(file, "-ironbank-") {
+		return checkIronbankDocker(t, file)
+	}
+
 	p, info, err := readDocker(t, file, true)
 	if err != nil {
 		t.Errorf("error reading file %v: %v", file, err)
@@ -436,12 +457,15 @@ func checkDocker(t *testing.T, file string, fipsPackage bool) (string, int64) {
 	checkDockerEntryPoint(t, p, info)
 	checkDockerLabels(t, p, info, file)
 	checkDockerUser(t, p, info, *rootUserContainer)
-	checkFilePermissions(t, p, configFilePattern, os.FileMode(0644))
+	checkRequiredFilePermissions(t, p, configFilePattern, os.FileMode(0644))
 	if !fipsPackage {
 		// FIPS docker image do not contain an otelcol script, run this check only on non FIPS-capable images
-		checkFilePermissions(t, p, otelcolScriptPattern, os.FileMode(0755))
+		checkRequiredFilePermissions(t, p, otelcolScriptPattern, os.FileMode(0755))
 	}
 	checkManifestPermissionsWithMode(t, p, os.FileMode(0644))
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 	checkModulesPresent(t, "", p)
 	checkModulesDPresent(t, "", p)
 	checkHintsInputsD(t, "hints.inputs.d", hintsInputsDFilePattern, p)
@@ -489,9 +513,12 @@ func checkEdotCollectorDocker(t *testing.T, file string) (string, int64) {
 	checkDockerEntryPoint(t, p, info)
 	checkDockerLabels(t, p, info, file)
 	checkDockerUser(t, p, info, *rootUserContainer)
-	checkFilePermissions(t, p, configFilePattern, os.FileMode(0644))
-	checkFilePermissions(t, p, otelcolScriptPattern, os.FileMode(0755))
+	checkRequiredFilePermissions(t, p, configFilePattern, os.FileMode(0644))
+	checkRequiredFilePermissions(t, p, otelcolScriptPattern, os.FileMode(0755))
 	checkManifestPermissionsWithMode(t, p, os.FileMode(0644))
+	checkFilePermissions(t, p, otelSamplesFilePattern, expectedManifestMode)
+	checkFilePermissions(t, p, otelCollectorSpecPattern, expectedManifestMode)
+	checkFilePermissions(t, p, endpointResourcesZipPattern, expectedManifestMode)
 	checkModulesPresent(t, "", p)
 	checkModulesDPresent(t, "", p)
 	checkLicensesPresent(t, "licenses/", p)
@@ -505,6 +532,25 @@ func checkEdotCollectorDocker(t *testing.T, file string) (string, int64) {
 	return name, info.Size
 }
 
+// checkIronbankDocker verifies the Ironbank variant. Its Dockerfile broadly
+// relaxes permissions under data/ and then has to restore the component .yml
+// files to 0644; the agent refuses to start if they stay group/world writable.
+func checkIronbankDocker(t *testing.T, file string) (string, int64) {
+	p, info, err := readDocker(t, file, true)
+	if err != nil {
+		t.Errorf("error reading file %v: %v", file, err)
+		return "", -1
+	}
+
+	checkDockerEntryPoint(t, p, info)
+	checkDockerUser(t, p, info, *rootUserContainer)
+	checkRequiredFilePermissions(t, p, componentYmlPattern, os.FileMode(0644))
+
+	// Image labels are supplied by Ironbank from the hardening manifest, so
+	// there is no version label to derive the name from.
+	return "elastic-agent-ironbank", info.Size
+}
+
 func checkCompleteDocker(t *testing.T, file string) {
 	p, _, err := readDocker(t, file, false)
 	if err != nil {
@@ -516,22 +562,30 @@ func checkCompleteDocker(t *testing.T, file string) {
 
 // Verify that the main configuration file is installed with a 0600 file mode.
 func checkConfigPermissions(t *testing.T, p *packageFile) {
-	checkFilePermissions(t, p, configFilePattern, expectedConfigMode)
+	checkRequiredFilePermissions(t, p, configFilePattern, expectedConfigMode)
 }
 
-func checkFilePermissions(t *testing.T, p *packageFile, configPattern *regexp.Regexp, expectedMode os.FileMode) {
-	t.Run("file permissions", func(t *testing.T) {
-		for _, entry := range p.Contents {
-			if configPattern.MatchString(entry.File) {
-				mode := entry.Mode.Perm()
-				if expectedMode != mode {
-					t.Errorf("file %v has wrong permissions: expected=%v actual=%v",
-						entry.File, expectedMode, mode)
-				}
-				return
+func checkFilePermissions(t *testing.T, p *packageFile, pattern *regexp.Regexp, expectedMode os.FileMode) int {
+	t.Helper()
+	matched := 0
+	for _, entry := range p.Contents {
+		if pattern.MatchString(entry.File) {
+			matched++
+			mode := entry.Mode.Perm()
+			if expectedMode != mode {
+				t.Errorf("file %v has wrong permissions: expected=%v actual=%v",
+					entry.File, expectedMode, mode)
 			}
 		}
-		t.Errorf("no config file found matching %v", configPattern)
+	}
+	return matched
+}
+
+func checkRequiredFilePermissions(t *testing.T, p *packageFile, pattern *regexp.Regexp, expectedMode os.FileMode) {
+	t.Run("file permissions", func(t *testing.T) {
+		if matched := checkFilePermissions(t, p, pattern, expectedMode); matched == 0 {
+			t.Errorf("no file found matching %v", pattern)
+		}
 	})
 }
 
@@ -567,15 +621,7 @@ func checkManifestPermissions(t *testing.T, p *packageFile) {
 
 func checkManifestPermissionsWithMode(t *testing.T, p *packageFile, expectedMode os.FileMode) {
 	t.Run("manifest file permissions", func(t *testing.T) {
-		for _, entry := range p.Contents {
-			if manifestFilePattern.MatchString(entry.File) {
-				mode := entry.Mode.Perm()
-				if expectedMode != mode {
-					t.Errorf("file %v has wrong permissions: expected=%v actual=%v",
-						entry.File, expectedMode, mode)
-				}
-			}
-		}
+		checkFilePermissions(t, p, manifestFilePattern, expectedMode)
 	})
 }
 
@@ -622,22 +668,23 @@ func checkModulesOwner(t *testing.T, p *packageFile, expectRoot bool) {
 	})
 }
 
-// Verify that the systemd unit file has a mode of 0644. It should not be
-// executable.
-func checkSystemdUnitPermissions(t *testing.T, p *packageFile) {
-	const expectedMode = os.FileMode(0644)
-	t.Run("systemd unit file permissions", func(t *testing.T) {
-		for _, entry := range p.Contents {
-			if systemdUnitFilePattern.MatchString(entry.File) {
-				mode := entry.Mode.Perm()
-				if expectedMode != mode {
-					t.Errorf("file %v has wrong permissions: expected=%v actual=%v",
-						entry.File, expectedMode, mode)
-				}
-				return
+// checkCloudDefendNotPresent verifies cloud-defend is absent from tar.gz packages.
+// Cloud Defend is only supported in Docker images.
+func checkCloudDefendNotPresent(t *testing.T, p *packageFile) {
+	t.Run("cloud-defend not present", func(t *testing.T) {
+		for name := range p.Contents {
+			if cloudDefendPattern.MatchString(name) {
+				t.Errorf("cloud-defend must not be included in tar.gz packages, found: %s", name)
 			}
 		}
-		t.Errorf("no systemd unit file found matching %v", configFilePattern)
+	})
+}
+
+func checkSystemdUnitPermissions(t *testing.T, p *packageFile) {
+	t.Run("systemd unit file permissions", func(t *testing.T) {
+		if matched := checkFilePermissions(t, p, systemdUnitFilePattern, os.FileMode(0644)); matched == 0 {
+			t.Errorf("no systemd unit file found matching %v", systemdUnitFilePattern)
+		}
 	})
 }
 
@@ -844,47 +891,35 @@ func checkFIPS(t *testing.T, agentPackageRootDir string) {
 			require.NoError(t, err)
 
 			foundTags := false
-			foundExperiment := false
+			foundFIPS := false
+			foundFIPSDefault := false
 			for _, setting := range info.Settings {
 				switch setting.Key {
 				case "-tags":
 					foundTags = true
 					require.Contains(t, setting.Value, "requirefips")
-
-					// Check if the ms_tls13kdf build tag is set only if the binary was built
-					// with go1.24.x (see https://github.com/microsoft/go/pull/1662).
-					if strings.HasPrefix(info.GoVersion, "go1.24") {
-						require.Contains(t, setting.Value, "ms_tls13kdf")
-					}
 					continue
-				case "GOEXPERIMENT":
-					foundExperiment = true
-					require.Contains(t, setting.Value, "systemcrypto")
+				case "GOFIPS140":
+					foundFIPS = true
+					// Go embeds a commit hash suffix (e.g. v1.0.0-c2097c7c), so check by prefix.
+					require.True(t, strings.HasPrefix(setting.Value, "v1.0.0"), "GOFIPS140 must reference the certified module version v1.0.0, got: %s", setting.Value)
+					continue
+				case "DefaultGODEBUG":
+					for _, entry := range strings.Split(setting.Value, ",") {
+						// Accept both "on" (default when GOFIPS140 is set) and "only" (stricter
+						// mode set via //go:debug fips140=only, which disallows non-FIPS fallbacks).
+						if key, val, ok := strings.Cut(entry, "="); ok && key == "fips140" && (val == "on" || val == "only") {
+							foundFIPSDefault = true
+							break
+						}
+					}
 					continue
 				}
 			}
 
 			require.True(t, foundTags, "Did not find -tags within binary version information")
-			require.True(t, foundExperiment, "Did not find GOEXPERIMENT within binary version information")
-
-			// TODO only elf is supported at the moment, in the future we will need to use macho (darwin) and pe (windows)
-			f, err := elf.Open(binary)
-			require.NoError(t, err, "unable to open ELF file")
-
-			symbols, err := f.Symbols()
-			if err != nil {
-				t.Logf("no symbols present in %q: %v", binary, err)
-				return
-			}
-
-			hasOpenSSL := false
-			for _, symbol := range symbols {
-				if strings.Contains(symbol.Name, "OpenSSL_version") {
-					hasOpenSSL = true
-					break
-				}
-			}
-			require.True(t, hasOpenSSL, "unable to find OpenSSL_version symbol")
+			require.True(t, foundFIPS, "Did not find GOFIPS140 within binary version information")
+			require.True(t, foundFIPSDefault, "Did not find fips140=on or fips140=only in DefaultGODEBUG — binary will not enforce FIPS mode at runtime")
 		})
 	}
 }

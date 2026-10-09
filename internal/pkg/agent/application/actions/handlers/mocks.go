@@ -16,11 +16,12 @@ import (
 
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/reexec"
 	"github.com/elastic/elastic-agent/internal/pkg/diagnostics"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/component/runtime"
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
 )
 
 // NewMockUploader creates a new instance of MockUploader. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
@@ -29,10 +30,19 @@ func NewMockUploader(t interface {
 	mock.TestingT
 	Cleanup(func())
 }) *MockUploader {
+	if helper, ok := t.(interface{ Helper() }); ok {
+		helper.Helper()
+	}
+
 	mock := &MockUploader{}
 	mock.Mock.Test(t)
 
-	t.Cleanup(func() { mock.AssertExpectations(t) })
+	t.Cleanup(func() {
+		if helper, ok := t.(interface{ Helper() }); ok {
+			helper.Helper()
+		}
+		mock.AssertExpectations(t)
+	})
 
 	return mock
 }
@@ -87,7 +97,7 @@ type MockUploader_UploadDiagnostics_Call struct {
 //   - s1 string
 //   - n int64
 //   - reader io.Reader
-func (_e *MockUploader_Expecter) UploadDiagnostics(context1 interface{}, s interface{}, s1 interface{}, n interface{}, reader interface{}) *MockUploader_UploadDiagnostics_Call {
+func (_e *MockUploader_Expecter) UploadDiagnostics(context1 any, s any, s1 any, n any, reader any) *MockUploader_UploadDiagnostics_Call {
 	return &MockUploader_UploadDiagnostics_Call{Call: _e.mock.On("UploadDiagnostics", context1, s, s1, n, reader)}
 }
 
@@ -140,10 +150,19 @@ func newMockDiagnosticsProvider(t interface {
 	mock.TestingT
 	Cleanup(func())
 }) *mockDiagnosticsProvider {
+	if helper, ok := t.(interface{ Helper() }); ok {
+		helper.Helper()
+	}
+
 	mock := &mockDiagnosticsProvider{}
 	mock.Mock.Test(t)
 
-	t.Cleanup(func() { mock.AssertExpectations(t) })
+	t.Cleanup(func() {
+		if helper, ok := t.(interface{ Helper() }); ok {
+			helper.Helper()
+		}
+		mock.AssertExpectations(t)
+	})
 
 	return mock
 }
@@ -210,11 +229,11 @@ func (_c *mockDiagnosticsProvider_DiagnosticHooks_Call) RunAndReturn(run func() 
 // PerformComponentDiagnostics provides a mock function for the type mockDiagnosticsProvider
 func (_mock *mockDiagnosticsProvider) PerformComponentDiagnostics(ctx context.Context, additionalMetrics []cproto.AdditionalDiagnosticRequest, req ...component.Component) ([]runtime.ComponentDiagnostic, error) {
 	// component.Component
-	_va := make([]interface{}, len(req))
+	_va := make([]any, len(req))
 	for _i := range req {
 		_va[_i] = req[_i]
 	}
-	var _ca []interface{}
+	var _ca []any
 	_ca = append(_ca, ctx, additionalMetrics)
 	_ca = append(_ca, _va...)
 	ret := _mock.Called(_ca...)
@@ -252,9 +271,9 @@ type mockDiagnosticsProvider_PerformComponentDiagnostics_Call struct {
 //   - ctx context.Context
 //   - additionalMetrics []cproto.AdditionalDiagnosticRequest
 //   - req ...component.Component
-func (_e *mockDiagnosticsProvider_Expecter) PerformComponentDiagnostics(ctx interface{}, additionalMetrics interface{}, req ...interface{}) *mockDiagnosticsProvider_PerformComponentDiagnostics_Call {
+func (_e *mockDiagnosticsProvider_Expecter) PerformComponentDiagnostics(ctx any, additionalMetrics any, req ...any) *mockDiagnosticsProvider_PerformComponentDiagnostics_Call {
 	return &mockDiagnosticsProvider_PerformComponentDiagnostics_Call{Call: _e.mock.On("PerformComponentDiagnostics",
-		append([]interface{}{ctx, additionalMetrics}, req...)...)}
+		append([]any{ctx, additionalMetrics}, req...)...)}
 }
 
 func (_c *mockDiagnosticsProvider_PerformComponentDiagnostics_Call) Run(run func(ctx context.Context, additionalMetrics []cproto.AdditionalDiagnosticRequest, req ...component.Component)) *mockDiagnosticsProvider_PerformComponentDiagnostics_Call {
@@ -297,11 +316,11 @@ func (_c *mockDiagnosticsProvider_PerformComponentDiagnostics_Call) RunAndReturn
 // PerformDiagnostics provides a mock function for the type mockDiagnosticsProvider
 func (_mock *mockDiagnosticsProvider) PerformDiagnostics(ctx context.Context, req ...runtime.ComponentUnitDiagnosticRequest) []runtime.ComponentUnitDiagnostic {
 	// runtime.ComponentUnitDiagnosticRequest
-	_va := make([]interface{}, len(req))
+	_va := make([]any, len(req))
 	for _i := range req {
 		_va[_i] = req[_i]
 	}
-	var _ca []interface{}
+	var _ca []any
 	_ca = append(_ca, ctx)
 	_ca = append(_ca, _va...)
 	ret := _mock.Called(_ca...)
@@ -329,9 +348,9 @@ type mockDiagnosticsProvider_PerformDiagnostics_Call struct {
 // PerformDiagnostics is a helper method to define mock.On call
 //   - ctx context.Context
 //   - req ...runtime.ComponentUnitDiagnosticRequest
-func (_e *mockDiagnosticsProvider_Expecter) PerformDiagnostics(ctx interface{}, req ...interface{}) *mockDiagnosticsProvider_PerformDiagnostics_Call {
+func (_e *mockDiagnosticsProvider_Expecter) PerformDiagnostics(ctx any, req ...any) *mockDiagnosticsProvider_PerformDiagnostics_Call {
 	return &mockDiagnosticsProvider_PerformDiagnostics_Call{Call: _e.mock.On("PerformDiagnostics",
-		append([]interface{}{ctx}, req...)...)}
+		append([]any{ctx}, req...)...)}
 }
 
 func (_c *mockDiagnosticsProvider_PerformDiagnostics_Call) Run(run func(ctx context.Context, req ...runtime.ComponentUnitDiagnosticRequest)) *mockDiagnosticsProvider_PerformDiagnostics_Call {
@@ -372,10 +391,19 @@ func newMockUpgradeCoordinator(t interface {
 	mock.TestingT
 	Cleanup(func())
 }) *mockUpgradeCoordinator {
+	if helper, ok := t.(interface{ Helper() }); ok {
+		helper.Helper()
+	}
+
 	mock := &mockUpgradeCoordinator{}
 	mock.Mock.Test(t)
 
-	t.Cleanup(func() { mock.AssertExpectations(t) })
+	t.Cleanup(func() {
+		if helper, ok := t.(interface{ Helper() }); ok {
+			helper.Helper()
+		}
+		mock.AssertExpectations(t)
+	})
 
 	return mock
 }
@@ -432,7 +460,7 @@ type mockUpgradeCoordinator_PerformAction_Call struct {
 //   - unit component.Unit
 //   - name string
 //   - params map[string]interface{}
-func (_e *mockUpgradeCoordinator_Expecter) PerformAction(ctx interface{}, comp interface{}, unit interface{}, name interface{}, params interface{}) *mockUpgradeCoordinator_PerformAction_Call {
+func (_e *mockUpgradeCoordinator_Expecter) PerformAction(ctx any, comp any, unit any, name any, params any) *mockUpgradeCoordinator_PerformAction_Call {
 	return &mockUpgradeCoordinator_PerformAction_Call{Call: _e.mock.On("PerformAction", ctx, comp, unit, name, params)}
 }
 
@@ -524,14 +552,14 @@ func (_c *mockUpgradeCoordinator_State_Call) RunAndReturn(run func() coordinator
 }
 
 // Upgrade provides a mock function for the type mockUpgradeCoordinator
-func (_mock *mockUpgradeCoordinator) Upgrade(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt) error {
+func (_mock *mockUpgradeCoordinator) Upgrade(ctx context.Context, version string, sources []string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt) error {
 	// coordinator.UpgradeOpt
-	_va := make([]interface{}, len(opts))
+	_va := make([]any, len(opts))
 	for _i := range opts {
 		_va[_i] = opts[_i]
 	}
-	var _ca []interface{}
-	_ca = append(_ca, ctx, version, sourceURI, action)
+	var _ca []any
+	_ca = append(_ca, ctx, version, sources, action)
 	_ca = append(_ca, _va...)
 	ret := _mock.Called(_ca...)
 
@@ -540,8 +568,8 @@ func (_mock *mockUpgradeCoordinator) Upgrade(ctx context.Context, version string
 	}
 
 	var r0 error
-	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string, *fleetapi.ActionUpgrade, ...coordinator.UpgradeOpt) error); ok {
-		r0 = returnFunc(ctx, version, sourceURI, action, opts...)
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []string, *fleetapi.ActionUpgrade, ...coordinator.UpgradeOpt) error); ok {
+		r0 = returnFunc(ctx, version, sources, action, opts...)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -556,15 +584,15 @@ type mockUpgradeCoordinator_Upgrade_Call struct {
 // Upgrade is a helper method to define mock.On call
 //   - ctx context.Context
 //   - version string
-//   - sourceURI string
+//   - sources []string
 //   - action *fleetapi.ActionUpgrade
 //   - opts ...coordinator.UpgradeOpt
-func (_e *mockUpgradeCoordinator_Expecter) Upgrade(ctx interface{}, version interface{}, sourceURI interface{}, action interface{}, opts ...interface{}) *mockUpgradeCoordinator_Upgrade_Call {
+func (_e *mockUpgradeCoordinator_Expecter) Upgrade(ctx any, version any, sources any, action any, opts ...any) *mockUpgradeCoordinator_Upgrade_Call {
 	return &mockUpgradeCoordinator_Upgrade_Call{Call: _e.mock.On("Upgrade",
-		append([]interface{}{ctx, version, sourceURI, action}, opts...)...)}
+		append([]any{ctx, version, sources, action}, opts...)...)}
 }
 
-func (_c *mockUpgradeCoordinator_Upgrade_Call) Run(run func(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt)) *mockUpgradeCoordinator_Upgrade_Call {
+func (_c *mockUpgradeCoordinator_Upgrade_Call) Run(run func(ctx context.Context, version string, sources []string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt)) *mockUpgradeCoordinator_Upgrade_Call {
 	_c.Call.Run(func(args mock.Arguments) {
 		var arg0 context.Context
 		if args[0] != nil {
@@ -574,9 +602,9 @@ func (_c *mockUpgradeCoordinator_Upgrade_Call) Run(run func(ctx context.Context,
 		if args[1] != nil {
 			arg1 = args[1].(string)
 		}
-		var arg2 string
+		var arg2 []string
 		if args[2] != nil {
-			arg2 = args[2].(string)
+			arg2 = args[2].([]string)
 		}
 		var arg3 *fleetapi.ActionUpgrade
 		if args[3] != nil {
@@ -606,7 +634,7 @@ func (_c *mockUpgradeCoordinator_Upgrade_Call) Return(err error) *mockUpgradeCoo
 	return _c
 }
 
-func (_c *mockUpgradeCoordinator_Upgrade_Call) RunAndReturn(run func(ctx context.Context, version string, sourceURI string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt) error) *mockUpgradeCoordinator_Upgrade_Call {
+func (_c *mockUpgradeCoordinator_Upgrade_Call) RunAndReturn(run func(ctx context.Context, version string, sources []string, action *fleetapi.ActionUpgrade, opts ...coordinator.UpgradeOpt) error) *mockUpgradeCoordinator_Upgrade_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -617,10 +645,19 @@ func newMockLogLevelSetter(t interface {
 	mock.TestingT
 	Cleanup(func())
 }) *mockLogLevelSetter {
+	if helper, ok := t.(interface{ Helper() }); ok {
+		helper.Helper()
+	}
+
 	mock := &mockLogLevelSetter{}
 	mock.Mock.Test(t)
 
-	t.Cleanup(func() { mock.AssertExpectations(t) })
+	t.Cleanup(func() {
+		if helper, ok := t.(interface{ Helper() }); ok {
+			helper.Helper()
+		}
+		mock.AssertExpectations(t)
+	})
 
 	return mock
 }
@@ -636,6 +673,65 @@ type mockLogLevelSetter_Expecter struct {
 
 func (_m *mockLogLevelSetter) EXPECT() *mockLogLevelSetter_Expecter {
 	return &mockLogLevelSetter_Expecter{mock: &_m.Mock}
+}
+
+// ReExec provides a mock function for the type mockLogLevelSetter
+func (_mock *mockLogLevelSetter) ReExec(callback reexec.ShutdownCallbackFn, argOverrides ...string) {
+	// string
+	_va := make([]any, len(argOverrides))
+	for _i := range argOverrides {
+		_va[_i] = argOverrides[_i]
+	}
+	var _ca []any
+	_ca = append(_ca, callback)
+	_ca = append(_ca, _va...)
+	_mock.Called(_ca...)
+	return
+}
+
+// mockLogLevelSetter_ReExec_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ReExec'
+type mockLogLevelSetter_ReExec_Call struct {
+	*mock.Call
+}
+
+// ReExec is a helper method to define mock.On call
+//   - callback reexec.ShutdownCallbackFn
+//   - argOverrides ...string
+func (_e *mockLogLevelSetter_Expecter) ReExec(callback any, argOverrides ...any) *mockLogLevelSetter_ReExec_Call {
+	return &mockLogLevelSetter_ReExec_Call{Call: _e.mock.On("ReExec",
+		append([]any{callback}, argOverrides...)...)}
+}
+
+func (_c *mockLogLevelSetter_ReExec_Call) Run(run func(callback reexec.ShutdownCallbackFn, argOverrides ...string)) *mockLogLevelSetter_ReExec_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 reexec.ShutdownCallbackFn
+		if args[0] != nil {
+			arg0 = args[0].(reexec.ShutdownCallbackFn)
+		}
+		var arg1 []string
+		variadicArgs := make([]string, len(args)-1)
+		for i, a := range args[1:] {
+			if a != nil {
+				variadicArgs[i] = a.(string)
+			}
+		}
+		arg1 = variadicArgs
+		run(
+			arg0,
+			arg1...,
+		)
+	})
+	return _c
+}
+
+func (_c *mockLogLevelSetter_ReExec_Call) Return() *mockLogLevelSetter_ReExec_Call {
+	_c.Call.Return()
+	return _c
+}
+
+func (_c *mockLogLevelSetter_ReExec_Call) RunAndReturn(run func(callback reexec.ShutdownCallbackFn, argOverrides ...string)) *mockLogLevelSetter_ReExec_Call {
+	_c.Run(run)
+	return _c
 }
 
 // SetLogLevel provides a mock function for the type mockLogLevelSetter
@@ -663,7 +759,7 @@ type mockLogLevelSetter_SetLogLevel_Call struct {
 // SetLogLevel is a helper method to define mock.On call
 //   - ctx context.Context
 //   - lvl *logp.Level
-func (_e *mockLogLevelSetter_Expecter) SetLogLevel(ctx interface{}, lvl interface{}) *mockLogLevelSetter_SetLogLevel_Call {
+func (_e *mockLogLevelSetter_Expecter) SetLogLevel(ctx any, lvl any) *mockLogLevelSetter_SetLogLevel_Call {
 	return &mockLogLevelSetter_SetLogLevel_Call{Call: _e.mock.On("SetLogLevel", ctx, lvl)}
 }
 

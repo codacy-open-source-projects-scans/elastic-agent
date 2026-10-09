@@ -5,6 +5,7 @@
 package upgrade
 
 import (
+	goerrors "errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,13 +15,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/details"
-	"github.com/elastic/elastic-agent/internal/pkg/agent/application/upgrade/ttl"
-	"github.com/elastic/elastic-agent/internal/pkg/fleetapi"
 	"github.com/elastic/elastic-agent/pkg/core/logger"
 	"github.com/elastic/elastic-agent/pkg/core/logger/loggertest"
+	"github.com/elastic/elastic-agent/pkg/fleetapi"
+	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 	agtversion "github.com/elastic/elastic-agent/pkg/version"
 )
+
+func TestCleanMarker_MissingMarkerIsOK(t *testing.T) {
+	dataDir := t.TempDir()
+
+	log, _ := loggertest.New(t.Name())
+	require.NoError(t, CleanMarker(log, dataDir))
+}
 
 func TestSaveAndLoadMarker_NoLoss(t *testing.T) {
 	// Create a temporary directory for the test
@@ -41,8 +48,8 @@ func TestSaveAndLoadMarker_NoLoss(t *testing.T) {
 			ActionID:   "action-123",
 			ActionType: "UPGRADE",
 			Data: fleetapi.ActionUpgradeData{
-				Version:   "8.5.0",
-				SourceURI: "https://example.com/upgrade",
+				Version: "8.5.0",
+				Sources: []string{"https://example.com/upgrade"},
 			},
 		},
 		Details: details.NewDetails(
@@ -81,21 +88,114 @@ func TestSaveAndLoadMarker_NoLoss(t *testing.T) {
 	require.NoError(t, err, "Failed to clean up marker file")
 }
 
+func TestMarker_LegacySourceURI(t *testing.T) {
+	t.Run("load with only source_uri", func(t *testing.T) {
+		dataDir := t.TempDir()
+		markerFile := markerFilePath(dataDir)
+		const sourceURI = "https://example.com/upgrade"
+		const markerYAML = `action:
+  id: action-123
+  type: UPGRADE
+  version: 8.5.0
+  source_uri: https://example.com/upgrade
+`
+		require.NoError(t, os.WriteFile(markerFile, []byte(markerYAML), 0o600))
+
+		marker, err := LoadMarker(dataDir)
+		require.NoError(t, err)
+		require.NotNil(t, marker.Action)
+		require.Equal(t, []string{sourceURI}, marker.Action.Data.Sources)
+	})
+
+	t.Run("load with both source_uri and sources", func(t *testing.T) {
+		dataDir := t.TempDir()
+		markerFile := markerFilePath(dataDir)
+		sources := []string{"https://primary.example.com/upgrade", "https://fallback.example.com/upgrade"}
+		const markerYAML = `action:
+  id: action-123
+  type: UPGRADE
+  version: 8.5.0
+  source_uri: https://legacy.example.com/upgrade
+  sources:
+    - https://primary.example.com/upgrade
+    - https://fallback.example.com/upgrade
+`
+		require.NoError(t, os.WriteFile(markerFile, []byte(markerYAML), 0o600))
+
+		marker, err := LoadMarker(dataDir)
+		require.NoError(t, err)
+		require.NotNil(t, marker.Action)
+		require.Equal(t, sources, marker.Action.Data.Sources)
+	})
+
+	t.Run("save writes both fields", func(t *testing.T) {
+		dataDir := t.TempDir()
+		markerFile := markerFilePath(dataDir)
+		sources := []string{"https://primary.example.com/upgrade", "https://fallback.example.com/upgrade"}
+		marker := &UpdateMarker{
+			Action: &fleetapi.ActionUpgrade{
+				ActionID:   "action-123",
+				ActionType: "UPGRADE",
+				Data: fleetapi.ActionUpgradeData{
+					Version: "8.5.0",
+					Sources: sources,
+				},
+			},
+		}
+
+		require.NoError(t, SaveMarker(dataDir, marker, true))
+
+		markerBytes, err := os.ReadFile(markerFile)
+		require.NoError(t, err)
+		require.Contains(t, string(markerBytes), "source_uri: "+sources[0])
+		require.Contains(t, string(markerBytes), "sources:")
+		for _, source := range sources {
+			require.Contains(t, string(markerBytes), "- "+source)
+		}
+	})
+}
+
+func TestTryLoadMarker_CorruptMarker(t *testing.T) {
+	// Simulate a power loss mid-write: the action line is cut off inside a
+	// flow mapping, leaving an unclosed string that yaml.Unmarshal rejects.
+	const truncatedMarkerYAML = `version: 9.0.0
+hash: a1b2c3
+versioned_home: data/elastic-agent-9.0.0-a1b2c3
+updated_on: 2026-04-20T10:00:00Z
+prev_version: 8.17.6
+action: {id: "fleet-action-abc1`
+
+	log, _ := loggertest.New(t.Name())
+	dataDir := t.TempDir()
+	markerFile := markerFilePath(dataDir)
+	require.NoError(t, os.WriteFile(markerFile, []byte(truncatedMarkerYAML), 0600))
+
+	marker, err := TryLoadMarker(log, dataDir)
+	require.NoError(t, err, "truncated marker must not cause a startup error")
+	require.Nil(t, marker, "truncated marker must return nil so startup can continue")
+	require.NoFileExists(t, markerFile, "corrupt marker file must have been moved aside")
+	require.FileExists(t, markerFile+".corrupt", "corrupt marker must be preserved for diagnostics")
+}
+
+func TestTryLoadMarker_MissingFile(t *testing.T) {
+	log, _ := loggertest.New(t.Name())
+	marker, err := TryLoadMarker(log, t.TempDir())
+	require.NoError(t, err)
+	require.Nil(t, marker)
+}
+
 func TestMarkUpgrade(t *testing.T) {
 	var parsed123SNAPSHOT = agtversion.NewParsedSemVer(1, 2, 3, "SNAPSHOT", "")
 	var parsed456SNAPSHOT = agtversion.NewParsedSemVer(4, 5, 6, "SNAPSHOT", "")
-	var parsed920SNAPSHOT = agtversion.NewParsedSemVer(9, 2, 0, "SNAPSHOT", "")
 	// fix a timestamp (truncated to the second because of loss of precision during marshalling/unmarshalling)
 	updatedOnNow := time.Now().UTC().Truncate(time.Second)
-	twentyFourHoursFromNow := updatedOnNow.Add(24 * time.Hour)
 
 	type args struct {
-		updatedOn          time.Time
-		currentAgent       agentInstall
-		previousAgent      agentInstall
-		action             *fleetapi.ActionUpgrade
-		details            *details.Details
-		availableRollbacks map[string]ttl.TTLMarker
+		updatedOn     time.Time
+		currentAgent  agentInstall
+		previousAgent agentInstall
+		action        *fleetapi.ActionUpgrade
+		details       *details.Details
 	}
 	type workingDirHook func(t *testing.T, dataDir string)
 
@@ -132,9 +232,8 @@ func TestMarkUpgrade(t *testing.T) {
 					hash:          "prvagt",
 					versionedHome: filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"),
 				},
-				action:             nil,
-				details:            details.NewDetails("4.5.6-SNAPSHOT", details.StateReplacing, ""),
-				availableRollbacks: nil,
+				action:  nil,
+				details: details.NewDetails("4.5.6-SNAPSHOT", details.StateReplacing, ""),
 			},
 			wantErr: assert.Error,
 		},
@@ -154,9 +253,8 @@ func TestMarkUpgrade(t *testing.T) {
 					hash:          "prvagt",
 					versionedHome: filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"),
 				},
-				action:             nil,
-				details:            details.NewDetails("4.5.6-SNAPSHOT", details.StateReplacing, ""),
-				availableRollbacks: nil,
+				action:  nil,
+				details: details.NewDetails("4.5.6-SNAPSHOT", details.StateReplacing, ""),
 			},
 			wantErr: assert.NoError,
 			assertAfterMark: func(t *testing.T, dataDir string) {
@@ -183,62 +281,6 @@ func TestMarkUpgrade(t *testing.T) {
 				assert.Equal(t, expectedMarker, actualMarker)
 			},
 		},
-		{
-			name: "available rollbacks passed in - available rollbacks must be present in upgrade marker",
-			args: args{
-				updatedOn: updatedOnNow,
-				currentAgent: agentInstall{
-					parsedVersion: parsed920SNAPSHOT,
-					version:       "9.2.0-SNAPSHOT",
-					hash:          "newagt",
-					versionedHome: filepath.Join("data", "elastic-agent-9.2.0-SNAPSHOT-newagt"),
-				},
-				previousAgent: agentInstall{
-					parsedVersion: parsed123SNAPSHOT,
-					version:       "1.2.3-SNAPSHOT",
-					hash:          "prvagt",
-					versionedHome: filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"),
-				},
-				action:  nil,
-				details: details.NewDetails("9.2.0-SNAPSHOT", details.StateReplacing, ""),
-				availableRollbacks: map[string]ttl.TTLMarker{
-					filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"): {
-						Version:    "1.2.3-SNAPSHOT",
-						ValidUntil: twentyFourHoursFromNow,
-					},
-				},
-			},
-			wantErr: assert.NoError,
-			assertAfterMark: func(t *testing.T, dataDir string) {
-				actualMarker, err := LoadMarker(dataDir)
-				require.NoError(t, err, "error reading actualMarker content after writing")
-
-				expectedMarker := &UpdateMarker{
-					Version:           "9.2.0-SNAPSHOT",
-					Hash:              "newagt",
-					VersionedHome:     filepath.Join("data", "elastic-agent-9.2.0-SNAPSHOT-newagt"),
-					UpdatedOn:         updatedOnNow,
-					PrevVersion:       "1.2.3-SNAPSHOT",
-					PrevHash:          "prvagt",
-					PrevVersionedHome: filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"),
-					Acked:             false,
-					Action:            nil,
-					Details: &details.Details{
-						TargetVersion: "9.2.0-SNAPSHOT",
-						State:         "UPG_REPLACING",
-						ActionID:      "",
-						Metadata:      details.Metadata{},
-					},
-					RollbacksAvailable: map[string]ttl.TTLMarker{
-						filepath.Join("data", "elastic-agent-1.2.3-SNAPSHOT-prvagt"): {
-							Version:    "1.2.3-SNAPSHOT",
-							ValidUntil: twentyFourHoursFromNow,
-						},
-					},
-				}
-				assert.Equal(t, expectedMarker, actualMarker)
-			},
-		},
 	}
 
 	// use the regular markUpgrade function, disabling the updateActiveCommitFunction that is bundled together
@@ -257,11 +299,61 @@ func TestMarkUpgrade(t *testing.T) {
 				tc.setupBeforeMark(t, dataDir)
 			}
 
-			err := markUpgrade(log, dataDir, tc.args.updatedOn, tc.args.currentAgent, tc.args.previousAgent, tc.args.action, tc.args.details, tc.args.availableRollbacks)
+			err := markUpgrade(log, dataDir, tc.args.updatedOn, tc.args.currentAgent, tc.args.previousAgent, tc.args.action, tc.args.details, nil)
 			tc.wantErr(t, err)
 			if tc.assertAfterMark != nil {
 				tc.assertAfterMark(t, dataDir)
 			}
 		})
 	}
+}
+
+func TestMarkUpgradeFailed(t *testing.T) {
+	cause := goerrors.New("upgrade boom")
+
+	t.Run("no marker on disk: det is failed and no error", func(t *testing.T) {
+		dataDir := t.TempDir()
+		det := details.NewDetails("8.5.0", details.StateReplacing, "action-1")
+
+		err := MarkUpgradeFailed(dataDir, det, cause)
+		require.NoError(t, err)
+		require.Equal(t, details.StateFailed, det.State, "in-memory details must reflect failure")
+		require.NoFileExists(t, filepath.Join(dataDir, markerFilename))
+	})
+
+	t.Run("marker on disk is rewritten with state=Failed", func(t *testing.T) {
+		dataDir := t.TempDir()
+		det := details.NewDetails("8.5.0", details.StateReplacing, "action-2")
+		original := &UpdateMarker{
+			Version:       "8.5.0",
+			Hash:          "abc123",
+			VersionedHome: "data/elastic-agent-abc123",
+			UpdatedOn:     time.Now(),
+			Details:       det,
+		}
+		require.NoError(t, SaveMarker(dataDir, original, true), "seed marker")
+
+		err := MarkUpgradeFailed(dataDir, det, cause)
+		require.NoError(t, err)
+		require.Equal(t, details.StateFailed, det.State)
+
+		loaded, err := LoadMarker(dataDir)
+		require.NoError(t, err)
+		require.NotNil(t, loaded)
+		require.NotNil(t, loaded.Details)
+		require.Equal(t, details.StateFailed, loaded.Details.State,
+			"on-disk marker must carry the failed state")
+	})
+
+	t.Run("LoadMarker error: still fails det in memory", func(t *testing.T) {
+		// markerFilename as a directory makes LoadMarker fail with a read error.
+		dataDir := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(dataDir, markerFilename), 0o755))
+
+		det := details.NewDetails("8.5.0", details.StateReplacing, "action-3")
+		err := MarkUpgradeFailed(dataDir, det, cause)
+		require.Error(t, err, "load failure must be surfaced")
+		require.Equal(t, details.StateFailed, det.State,
+			"det must still reflect failure even when persistence fails")
+	})
 }
